@@ -896,6 +896,16 @@ int main(void)
 			    "Account Settings > API Keys.",
 			    "Set your server and API key in " CONFIG_PATH);
 
+	/* log the exact bytes of the server URL; invisible characters in the
+	 * config show up here when curl complains about the protocol */
+	{
+		char hex[3 * 64 + 1] = "";
+		int n = strlen(g_server);
+		for (int i = 0; i < n && i < 64; i++)
+			sprintf(hex + 3 * i, "%02x ", (unsigned char)g_server[i]);
+		log_line("server='%s' len=%d hex=%s", g_server, n, hex);
+	}
+
 	show_status("Loading library from %s ...", g_server);
 	fetch_page(1);
 	if (g_asset_count == 0)
