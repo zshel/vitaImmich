@@ -110,6 +110,8 @@ static void fatal_error(const char *detail, const char *fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 
+	log_line("FATAL: %s | %s", buf, detail ? detail : "-");
+
 	for (;;) {
 		SceCtrlData pad;
 		sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -241,6 +243,23 @@ static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
 	return add;
 }
 
+/* verbose-log the first request via curl's debug stream so connection
+ * problems land in log.txt with curl's own explanation */
+static int g_verbose_request = 1;
+
+static int curl_debug_cb(CURL *h, curl_infotype type, char *data,
+			 size_t size, void *ud)
+{
+	if (type == CURLINFO_TEXT && size > 0) {
+		char line[300];
+		if (data[size - 1] == '\n')
+			size--;
+		snprintf(line, sizeof(line), "%.*s", (int)size, data);
+		log_line("curl: %s", line);
+	}
+	return 0;
+}
+
 /* body == NULL -> GET, otherwise POST with a JSON body.
  * ctype (optional) receives the response Content-Type. */
 static CURLcode http_request(const char *url, const char *body,
@@ -279,8 +298,16 @@ static CURLcode http_request(const char *url, const char *body,
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 	if (body)
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	if (g_verbose_request) {
+		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+		curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, curl_debug_cb);
+	}
 
 	CURLcode res = curl_easy_perform(curl);
+	if (g_verbose_request) {
+		log_line("curl: perform result=%d (%s)", res, curl_easy_strerror(res));
+		g_verbose_request = 0;
+	}
 	if (res == CURLE_OK) {
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
 		if (ctype) {
@@ -889,6 +916,19 @@ int main(void)
 
 	show_status("Starting network...");
 	net_init();
+
+	/* runtime truth about what the linked libcurl supports */
+	{
+		curl_version_info_data *vi = curl_version_info(CURLVERSION_NOW);
+		log_line("libcurl %s | ssl: %s", vi->version,
+			 vi->ssl_version ? vi->ssl_version : "(none)");
+		char plist[300] = "";
+		for (const char *const *pp = vi->protocols; *pp; pp++) {
+			strncat(plist, *pp, sizeof(plist) - strlen(plist) - 2);
+			strncat(plist, " ", sizeof(plist) - strlen(plist) - 1);
+		}
+		log_line("protocols: %s", plist);
+	}
 
 	if (load_config() != 0)
 		fatal_error("Edit it with VitaShell, then restart the app. "
