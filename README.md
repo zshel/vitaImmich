@@ -37,6 +37,19 @@ This produces `build/vitaImmich.vpk`.
    apikey=your-immich-api-key
    ```
 
+   If your server sits behind a public domain (reverse proxy) and your
+   router does not support NAT loopback, add the server's LAN IP so the
+   domain is pinned to it while on your home network:
+
+   ```
+   server=https://immich.example.com
+   apikey=your-immich-api-key
+   serverip=192.168.1.100
+   ```
+
+   This keeps the Host header and TLS SNI on the domain (so the reverse
+   proxy still routes correctly) but connects to the LAN IP directly.
+
 4. Relaunch the app.
 
 ## Controls

@@ -11,7 +11,7 @@ endif()
 project(vitaImmich C)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
-set(VITA_APP_NAME "Vita Immich")
+set(VITA_APP_NAME "Immich")
 set(VITA_TITLEID  "VIMM00001")
 set(VITA_VERSION  "01.00")
 
@@ -47,4 +47,5 @@ vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
+  FILE ${CMAKE_SOURCE_DIR}/assets/sce_sys/icon0.png sce_sys/icon0.png
 )

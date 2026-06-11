@@ -51,6 +51,9 @@ int _newlib_heap_size_user = 192 * 1024 * 1024;
 
 static char g_server[512];
 static char g_apikey[256];
+static char g_serverip[64];
+/* optional DNS pin ("host:port:ip") for routers without NAT loopback */
+static struct curl_slist *g_resolve_list;
 
 static vita2d_pgf *g_font;
 
@@ -167,7 +170,9 @@ static int load_config(void)
 		f = fopen(CONFIG_PATH, "w");
 		if (f) {
 			fputs("server=http://192.168.1.100:2283\n"
-			      "apikey=PASTE_YOUR_IMMICH_API_KEY_HERE\n", f);
+			      "apikey=PASTE_YOUR_IMMICH_API_KEY_HERE\n"
+			      "# serverip=192.168.1.100  (optional: LAN IP of the\n"
+			      "#  server, for routers without NAT loopback)\n", f);
 			fclose(f);
 		}
 		return -1;
@@ -180,6 +185,8 @@ static int load_config(void)
 			snprintf(g_server, sizeof(g_server), "%s", clean_line(s + 7));
 		else if (!strncmp(s, "apikey=", 7))
 			snprintf(g_apikey, sizeof(g_apikey), "%s", clean_line(s + 7));
+		else if (!strncmp(s, "serverip=", 9))
+			snprintf(g_serverip, sizeof(g_serverip), "%s", clean_line(s + 9));
 	}
 	fclose(f);
 
@@ -200,6 +207,30 @@ static int load_config(void)
 	if (strncasecmp(g_server, "http://", 7) && strncasecmp(g_server, "https://", 8))
 		fatal_error(g_server,
 			    "Bad server URL in config (must start with http:// or https://):");
+
+	/* serverip= pins the hostname to a fixed IP (keeps Host header and
+	 * TLS SNI intact, unlike putting the IP in the URL) */
+	if (g_serverip[0]) {
+		int https = !strncasecmp(g_server, "https://", 8);
+		const char *host = strstr(g_server, "://") + 3;
+		char hostname[256];
+		size_t i = 0;
+		while (host[i] && host[i] != '/' && host[i] != ':' &&
+		       i < sizeof(hostname) - 1) {
+			hostname[i] = host[i];
+			i++;
+		}
+		hostname[i] = '\0';
+		int port = https ? 443 : 80;
+		if (host[i] == ':')
+			port = atoi(host + i + 1);
+
+		char resolve[400];
+		snprintf(resolve, sizeof(resolve), "%s:%d:%s",
+			 hostname, port, g_serverip);
+		g_resolve_list = curl_slist_append(NULL, resolve);
+		log_line("resolve pin: %s", resolve);
+	}
 	return 0;
 }
 
@@ -296,6 +327,8 @@ static CURLcode http_request(const char *url, const char *body,
 	/* PoC: no CA bundle on the Vita, skip TLS verification */
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	if (g_resolve_list)
+		curl_easy_setopt(curl, CURLOPT_RESOLVE, g_resolve_list);
 	if (body)
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 	if (g_verbose_request) {
@@ -725,6 +758,8 @@ static int worker_thread(SceSize args, void *argp)
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "vitaImmich/0.1 (PS Vita)");
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	if (g_resolve_list)
+		curl_easy_setopt(curl, CURLOPT_RESOLVE, g_resolve_list);
 
 	for (;;) {
 		if (g_req_state != REQ_PENDING) {
