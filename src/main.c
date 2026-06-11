@@ -142,11 +142,19 @@ static void fatal_error(const char *detail, const char *fmt, ...)
 /* config                                                              */
 /* ------------------------------------------------------------------ */
 
-static void strip_eol(char *s)
+/* trim whitespace on both ends and a UTF-8 BOM; editors sneak these in,
+ * and any of them makes curl fail with "unsupported protocol" */
+static char *clean_line(char *s)
 {
+	if (!strncmp(s, "\xEF\xBB\xBF", 3))
+		s += 3;
+	while (*s == ' ' || *s == '\t')
+		s++;
 	size_t n = strlen(s);
-	while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' '))
+	while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' ||
+			 s[n - 1] == ' ' || s[n - 1] == '\t'))
 		s[--n] = '\0';
+	return s;
 }
 
 static int load_config(void)
@@ -165,11 +173,11 @@ static int load_config(void)
 
 	char line[512];
 	while (fgets(line, sizeof(line), f)) {
-		strip_eol(line);
-		if (!strncmp(line, "server=", 7))
-			snprintf(g_server, sizeof(g_server), "%s", line + 7);
-		else if (!strncmp(line, "apikey=", 7))
-			snprintf(g_apikey, sizeof(g_apikey), "%s", line + 7);
+		char *s = clean_line(line);
+		if (!strncmp(s, "server=", 7))
+			snprintf(g_server, sizeof(g_server), "%s", clean_line(s + 7));
+		else if (!strncmp(s, "apikey=", 7))
+			snprintf(g_apikey, sizeof(g_apikey), "%s", clean_line(s + 7));
 	}
 	fclose(f);
 
@@ -180,6 +188,16 @@ static int load_config(void)
 
 	if (!g_server[0] || !g_apikey[0] || strstr(g_apikey, "PASTE_YOUR"))
 		return -1;
+
+	/* default to http:// when no scheme is given */
+	if (!strstr(g_server, "://")) {
+		char tmp[512];
+		snprintf(tmp, sizeof(tmp), "http://%s", g_server);
+		snprintf(g_server, sizeof(g_server), "%s", tmp);
+	}
+	if (strncasecmp(g_server, "http://", 7) && strncasecmp(g_server, "https://", 8))
+		fatal_error(g_server,
+			    "Bad server URL in config (must start with http:// or https://):");
 	return 0;
 }
 
@@ -548,9 +566,12 @@ static int fetch_page(int is_first)
 	long code;
 	CURLcode res = http_request(url, body, &buf, &code, NULL, 0);
 	if (res != CURLE_OK) {
-		if (is_first)
-			fatal_error(curl_easy_strerror(res),
-				    "Connection failed (curl error %d)", res);
+		if (is_first) {
+			char det[700];
+			snprintf(det, sizeof(det), "%s -- URL: %s",
+				 curl_easy_strerror(res), url);
+			fatal_error(det, "Connection failed (curl error %d)", res);
+		}
 		log_line("page %d: curl error %d", g_next_page, res);
 		g_next_page = 0;
 		free(buf.data);
