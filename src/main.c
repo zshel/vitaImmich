@@ -5,6 +5,13 @@
  * the library as a scrollable chronological grid (newest first).
  * X opens a photo full screen, O goes back. Videos are downloaded to the
  * memory card and played with SceAvPlayer (hardware MP4/H.264 decoding).
+ *
+ * It also scans the Vita's own camera media (ux0:picture, ux0:video),
+ * hashes it (SHA1) on a background sync thread, asks the server which files
+ * are already backed up (POST /api/assets/bulk-upload-check) and can upload
+ * the rest (POST /api/assets, multipart). Local files are merged into the
+ * same date-sorted grid with a per-cell status badge (cloud-only / local-
+ * only / backed-up). SELECT opens a sync overview where uploads are started.
  */
 
 #include <stdio.h>
@@ -14,6 +21,7 @@
 #include <setjmp.h>
 #include <malloc.h>
 
+#include <psp2/appmgr.h>
 #include <psp2/audioout.h>
 #include <psp2/avplayer.h>
 #include <psp2/ctrl.h>
@@ -21,6 +29,8 @@
 #include <psp2/kernel/sysmem.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/io/dirent.h>
+#include <psp2/rtc.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/net/net.h>
@@ -30,6 +40,7 @@
 #include <vita2d.h>
 #include <curl/curl.h>
 #include <jpeglib.h>
+#include <openssl/sha.h>
 
 #define JSMN_STATIC
 #define JSMN_PARENT_LINKS
@@ -47,6 +58,9 @@
 
 #define PAGE_SIZE  100
 #define MAX_ASSETS 1000
+#define MAX_LOCAL  500           /* cap on local camera files scanned */
+#define DATELEN    20            /* "YYYY-MM-DDTHH:MM:SS" + NUL, sortable */
+#define DISP_MAX   (MAX_ASSETS + MAX_LOCAL)
 
 #define CONFIG_DIR  "ux0:data/vitaimmich"
 #define CONFIG_PATH CONFIG_DIR "/config.txt"
@@ -62,17 +76,76 @@ static char g_serverip[64];
 /* optional DNS pin ("host:port:ip") for routers without NAT loopback */
 static struct curl_slist *g_resolve_list;
 
+/* folders scanned for camera media (config syncdir=, with defaults), and
+ * a size cap so a movie collection in ux0:video isn't hashed/synced */
+static char g_syncdirs[8][192];
+static int g_syncdir_count;
+static long g_syncmax_mb = 512;
+
 static vita2d_pgf *g_font;
 
 static char g_asset_ids[MAX_ASSETS][40];
-static char g_asset_dates[MAX_ASSETS][11]; /* YYYY-MM-DD */
+static char g_asset_dates[MAX_ASSETS][DATELEN]; /* YYYY-MM-DDTHH:MM:SS */
 static unsigned char g_asset_is_video[MAX_ASSETS];
+/* set during display rebuild: a backed-up local file matches this server
+ * asset, so its grid cell shows the green "backed up" badge */
+static unsigned char g_asset_local_backed[MAX_ASSETS];
 static int g_asset_count;
 static int g_next_page = 1; /* 0 = no more pages */
 
 static vita2d_texture *g_thumb[MAX_ASSETS];
 static int g_thumb_failed[MAX_ASSETS];
 static char g_tex_err[MAX_ASSETS][160];
+
+/* ------------------------------------------------------------------ */
+/* local camera media + sync state                                     */
+/* ------------------------------------------------------------------ */
+
+/* per-item sync state machine. transitions are written by the sync
+ * thread, except QUEUED which the main thread sets on a LOCAL_ONLY item
+ * (guarded the same way as the thumb worker's g_req_state handoff). */
+enum {
+	SYNC_UNSCANNED,  /* found on disk, not hashed yet */
+	SYNC_HASHING,    /* sync thread is computing SHA1 */
+	SYNC_CHECKING,   /* hashed, awaiting/under bulk-upload-check */
+	SYNC_LOCAL_ONLY, /* not on the server */
+	SYNC_QUEUED,     /* user asked to upload (main-thread write) */
+	SYNC_UPLOADING,  /* sync thread is POSTing it */
+	SYNC_BACKED_UP,  /* exists on the server */
+	SYNC_FAILED,     /* upload/check error (see g_local_err) */
+};
+
+static char g_local_path[MAX_LOCAL][256];
+static char g_local_date[MAX_LOCAL][DATELEN]; /* sortable mtime */
+static char g_local_sha1[MAX_LOCAL][41];      /* lowercase hex */
+static char g_local_server_id[MAX_LOCAL][40]; /* assetId once backed up */
+static char g_local_err[MAX_LOCAL][96];
+static SceDateTime g_local_mtime[MAX_LOCAL];
+static SceDateTime g_local_ctime[MAX_LOCAL];
+static long long g_local_size[MAX_LOCAL];
+static unsigned char g_local_is_video[MAX_LOCAL];
+static volatile int g_local_state[MAX_LOCAL];
+static int g_local_count;
+
+static vita2d_texture *g_local_thumb[MAX_LOCAL];
+static int g_local_thumb_failed[MAX_LOCAL];
+
+/* merged, date-desc display order of server + local items */
+enum { SRC_SERVER, SRC_LOCAL };
+struct disp_item { unsigned char src; int idx; };
+static struct disp_item g_disp[DISP_MAX];
+static int g_disp_count;
+
+/* the sync thread asks the main thread to rebuild g_disp (which the main
+ * thread also reads every frame) by setting this; one writer per side */
+static volatile int g_need_rebuild;
+
+/* sync thread -> sync overview screen (loose: status text only) */
+static volatile int g_sync_phase; /* 0 idle, 1 hashing, 2 checking, 3 uploading */
+static char g_sync_activity[160];
+static volatile curl_off_t g_ul_now, g_ul_total;
+static char g_sync_errlog[5][160];
+static volatile int g_sync_errn;
 
 static void log_line(const char *fmt, ...)
 {
@@ -180,7 +253,12 @@ static int load_config(void)
 			fputs("server=http://192.168.1.100:2283\n"
 			      "apikey=PASTE_YOUR_IMMICH_API_KEY_HERE\n"
 			      "# serverip=192.168.1.100  (optional: LAN IP of the\n"
-			      "#  server, for routers without NAT loopback)\n", f);
+			      "#  server, for routers without NAT loopback)\n"
+			      "# syncdir=ux0:picture  (optional, repeatable: folders\n"
+			      "#  to scan for camera media; default ux0:picture and\n"
+			      "#  ux0:video/CAMERA)\n"
+			      "# syncmaxmb=512  (skip files bigger than this many\n"
+			      "#  MB when syncing)\n", f);
 			fclose(f);
 		}
 		return -1;
@@ -195,6 +273,19 @@ static int load_config(void)
 			snprintf(g_apikey, sizeof(g_apikey), "%s", clean_line(s + 7));
 		else if (!strncmp(s, "serverip=", 9))
 			snprintf(g_serverip, sizeof(g_serverip), "%s", clean_line(s + 9));
+		else if (!strncmp(s, "syncdir=", 8)) {
+			if (g_syncdir_count < (int)(sizeof(g_syncdirs) /
+						    sizeof(g_syncdirs[0]))) {
+				char *d = clean_line(s + 8);
+				size_t dl = strlen(d);
+				while (dl > 0 && d[dl - 1] == '/')
+					d[--dl] = '\0';
+				if (dl > 0)
+					snprintf(g_syncdirs[g_syncdir_count++],
+						 sizeof(g_syncdirs[0]), "%s", d);
+			}
+		} else if (!strncmp(s, "syncmaxmb=", 10))
+			g_syncmax_mb = atol(clean_line(s + 10));
 	}
 	fclose(f);
 
@@ -605,8 +696,11 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 			snprintf(g_asset_ids[cur], sizeof(g_asset_ids[0]),
 				 "%.*s", vlen, js + val->start);
 		else if (klen == 13 && !strncmp(k, "fileCreatedAt", 13) && vlen >= 10)
+			/* keep "YYYY-MM-DDTHH:MM:SS" (or just the date) so the
+			 * merged grid can be sorted against local files */
 			snprintf(g_asset_dates[cur], sizeof(g_asset_dates[0]),
-				 "%.10s", js + val->start);
+				 "%.*s", vlen < DATELEN - 1 ? vlen : DATELEN - 1,
+				 js + val->start);
 		else if (klen == 4 && !strncmp(k, "type", 4))
 			g_asset_is_video[cur] =
 				(vlen == 5 && !strncmp(js + val->start, "VIDEO", 5));
@@ -751,6 +845,7 @@ enum { REQ_IDLE, REQ_PENDING, REQ_DONE };
 
 static volatile int g_req_state = REQ_IDLE;
 static volatile int g_req_idx = -1;
+static volatile int g_req_src = SRC_SERVER; /* SRC_SERVER or SRC_LOCAL */
 static unsigned char *g_req_pix;   /* decoded pixels, or NULL on failure */
 static int g_req_w, g_req_h, g_req_comps;
 static char *g_req_raw;            /* raw body when it's a PNG */
@@ -779,31 +874,62 @@ static int worker_thread(SceSize args, void *argp)
 			continue;
 		}
 		int idx = g_req_idx;
-		char *err = g_tex_err[idx];
-		const size_t errlen = sizeof(g_tex_err[idx]);
+		int src = g_req_src;
+		char local_err[160];
+		local_err[0] = '\0';
+		char *err = (src == SRC_LOCAL) ? local_err : g_tex_err[idx];
+		const size_t errlen = (src == SRC_LOCAL) ?
+			sizeof(local_err) : sizeof(g_tex_err[idx]);
+		const char *label = (src == SRC_LOCAL) ?
+			g_local_path[idx] : g_asset_ids[idx];
 		g_req_pix = NULL;
 		g_req_raw = NULL;
 
-		char url[700];
-		snprintf(url, sizeof(url), "%s/api/assets/%s/thumbnail?size=preview",
-			 g_server, g_asset_ids[idx]);
-
 		membuf buf = { NULL, 0 };
 		long code = 0;
-		curl_easy_setopt(curl, CURLOPT_URL, url);
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-		CURLcode res = curl_easy_perform(curl);
-		if (res == CURLE_OK)
-			curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+		CURLcode res = CURLE_OK;
 
-		if (res != CURLE_OK) {
+		if (src == SRC_LOCAL) {
+			/* read the camera JPEG/PNG off the memory card */
+			FILE *lf = fopen(g_local_path[idx], "rb");
+			if (!lf) {
+				snprintf(err, errlen, "open failed");
+			} else {
+				fseek(lf, 0, SEEK_END);
+				long sz = ftell(lf);
+				fseek(lf, 0, SEEK_SET);
+				if (sz > 0) {
+					buf.data = malloc(sz + 1);
+					if (buf.data) {
+						buf.size = fread(buf.data, 1, sz, lf);
+						buf.data[buf.size] = '\0';
+					}
+				}
+				fclose(lf);
+				if (!buf.data)
+					snprintf(err, errlen, "read failed (%ld bytes)", sz);
+			}
+		} else {
+			char url[700];
+			snprintf(url, sizeof(url),
+				 "%s/api/assets/%s/thumbnail?size=preview",
+				 g_server, g_asset_ids[idx]);
+			curl_easy_setopt(curl, CURLOPT_URL, url);
+			curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+			res = curl_easy_perform(curl);
+			if (res == CURLE_OK)
+				curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+		}
+
+		if (src == SRC_SERVER && res != CURLE_OK) {
 			snprintf(err, errlen, "curl error %d: %s",
 				 res, curl_easy_strerror(res));
-		} else if (code < 200 || code >= 300) {
+		} else if (src == SRC_SERVER && (code < 200 || code >= 300)) {
 			snprintf(err, errlen, "HTTP %ld: %.100s", code,
 				 buf.data ? buf.data : "(empty body)");
 		} else if (buf.size == 0) {
-			snprintf(err, errlen, "HTTP %ld but empty body", code);
+			if (!err[0])
+				snprintf(err, errlen, "empty body");
 		} else {
 			const unsigned char *p = (const unsigned char *)buf.data;
 			if (buf.size > 2 && p[0] == 0xff && p[1] == 0xd8) {
@@ -832,7 +958,7 @@ static int worker_thread(SceSize args, void *argp)
 		}
 		free(buf.data);
 		if (!g_req_pix && !g_req_raw)
-			log_line("%s: %s", g_asset_ids[idx], err);
+			log_line("thumb %s: %s", label, err);
 
 		__sync_synchronize();
 		g_req_state = REQ_DONE;
@@ -844,6 +970,12 @@ static int worker_thread(SceSize args, void *argp)
 static void consume_worker_result(void)
 {
 	int idx = g_req_idx;
+	int src = g_req_src;
+	char errbuf[64];
+	char *err = (src == SRC_LOCAL) ? errbuf :
+		    g_tex_err[idx];
+	size_t errlen = (src == SRC_LOCAL) ? sizeof(errbuf) :
+		    sizeof(g_tex_err[idx]);
 	vita2d_texture *tex = NULL;
 
 	if (g_req_pix) {
@@ -859,7 +991,7 @@ static void consume_worker_result(void)
 				memcpy(dst + y * stride,
 				       g_req_pix + y * rowbytes, rowbytes);
 		} else {
-			snprintf(g_tex_err[idx], sizeof(g_tex_err[idx]),
+			snprintf(err, errlen,
 				 "texture alloc failed (%dx%d)", g_req_w, g_req_h);
 		}
 		free(g_req_pix);
@@ -867,32 +999,141 @@ static void consume_worker_result(void)
 	} else if (g_req_raw) {
 		tex = vita2d_load_PNG_buffer(g_req_raw);
 		if (!tex)
-			snprintf(g_tex_err[idx], sizeof(g_tex_err[idx]),
-				 "PNG decode failed; %u bytes",
+			snprintf(err, errlen, "PNG decode failed; %u bytes",
 				 (unsigned)g_req_raw_size);
 		free(g_req_raw);
 		g_req_raw = NULL;
 	}
 
-	g_thumb[idx] = tex;
-	g_thumb_failed[idx] = (tex == NULL);
+	if (src == SRC_LOCAL) {
+		g_local_thumb[idx] = tex;
+		g_local_thumb_failed[idx] = (tex == NULL);
+	} else {
+		g_thumb[idx] = tex;
+		g_thumb_failed[idx] = (tex == NULL);
+	}
 	g_req_state = REQ_IDLE;
+}
+
+/* ------------------------------------------------------------------ */
+/* merged display model (server + local items)                         */
+/* ------------------------------------------------------------------ */
+
+static const char *disp_date(int d)
+{
+	struct disp_item *it = &g_disp[d];
+	return it->src == SRC_LOCAL ? g_local_date[it->idx]
+				    : g_asset_dates[it->idx];
+}
+
+static int disp_is_video(int d)
+{
+	struct disp_item *it = &g_disp[d];
+	return it->src == SRC_LOCAL ? g_local_is_video[it->idx]
+				    : g_asset_is_video[it->idx];
+}
+
+static vita2d_texture *disp_thumb(int d)
+{
+	struct disp_item *it = &g_disp[d];
+	return it->src == SRC_LOCAL ? g_local_thumb[it->idx]
+				    : g_thumb[it->idx];
+}
+
+static int disp_thumb_failed(int d)
+{
+	struct disp_item *it = &g_disp[d];
+	return it->src == SRC_LOCAL ? g_local_thumb_failed[it->idx]
+				    : g_thumb_failed[it->idx];
+}
+
+/* local videos have no poster frame, so the loader never requests them
+ * (a dark placeholder cell is drawn instead) */
+static int disp_wants_thumb(int d)
+{
+	if (g_disp[d].src == SRC_LOCAL && g_local_is_video[g_disp[d].idx])
+		return 0;
+	return !disp_thumb(d) && !disp_thumb_failed(d);
+}
+
+/* is some server asset id present among the fetched assets? */
+static int server_has_id(const char *id)
+{
+	if (!id[0])
+		return 0;
+	for (int i = 0; i < g_asset_count; i++)
+		if (!strcmp(g_asset_ids[i], id))
+			return 1;
+	return 0;
+}
+
+static int disp_cmp(const void *a, const void *b)
+{
+	const struct disp_item *x = a, *y = b;
+	const char *dx = x->src == SRC_LOCAL ? g_local_date[x->idx]
+					     : g_asset_dates[x->idx];
+	const char *dy = y->src == SRC_LOCAL ? g_local_date[y->idx]
+					     : g_asset_dates[y->idx];
+	return strcmp(dy, dx); /* newest first */
+}
+
+/* rebuild the merged, date-desc display order. main-thread only (the grid
+ * reads g_disp every frame). a backed-up local file that matches a fetched
+ * server asset is shown once, as the server asset (green badge). */
+static void rebuild_display(void)
+{
+	for (int i = 0; i < g_asset_count; i++)
+		g_asset_local_backed[i] = 0;
+
+	int n = 0;
+	for (int i = 0; i < g_asset_count && n < DISP_MAX; i++) {
+		g_disp[n].src = SRC_SERVER;
+		g_disp[n].idx = i;
+		n++;
+	}
+	for (int j = 0; j < g_local_count && n < DISP_MAX; j++) {
+		if (g_local_state[j] == SYNC_BACKED_UP &&
+		    server_has_id(g_local_server_id[j])) {
+			/* fold into the matching server cell */
+			for (int i = 0; i < g_asset_count; i++)
+				if (!strcmp(g_asset_ids[i], g_local_server_id[j])) {
+					g_asset_local_backed[i] = 1;
+					break;
+				}
+			continue;
+		}
+		g_disp[n].src = SRC_LOCAL;
+		g_disp[n].idx = j;
+		n++;
+	}
+	g_disp_count = n;
+	qsort(g_disp, n, sizeof(g_disp[0]), disp_cmp);
+}
+
+/* find the display slot for a given source item (after a rebuild reorders
+ * things, to keep the selection on the same photo) */
+static int find_disp(unsigned char src, int idx)
+{
+	for (int i = 0; i < g_disp_count; i++)
+		if (g_disp[i].src == src && g_disp[i].idx == idx)
+			return i;
+	return -1;
 }
 
 /* pick the most useful thumbnail to load next: selection, then visible,
  * then prefetch a couple of rows below and above the viewport */
 static int pick_next_load(int sel, int first_vis, int last_vis)
 {
-	if (!g_thumb[sel] && !g_thumb_failed[sel])
+	if (sel >= 0 && sel < g_disp_count && disp_wants_thumb(sel))
 		return sel;
-	for (int i = first_vis; i >= 0 && i <= last_vis && i < g_asset_count; i++)
-		if (!g_thumb[i] && !g_thumb_failed[i])
+	for (int i = first_vis; i >= 0 && i <= last_vis && i < g_disp_count; i++)
+		if (disp_wants_thumb(i))
 			return i;
-	for (int i = last_vis + 1; i <= last_vis + 2 * COLS && i < g_asset_count; i++)
-		if (i >= 0 && !g_thumb[i] && !g_thumb_failed[i])
+	for (int i = last_vis + 1; i <= last_vis + 2 * COLS && i < g_disp_count; i++)
+		if (i >= 0 && disp_wants_thumb(i))
 			return i;
 	for (int i = first_vis - 1; i >= first_vis - 2 * COLS && i >= 0; i--)
-		if (!g_thumb[i] && !g_thumb_failed[i])
+		if (disp_wants_thumb(i))
 			return i;
 	return -1;
 }
@@ -1341,10 +1582,606 @@ static void view_video(int idx)
 }
 
 /* ------------------------------------------------------------------ */
+/* local camera media: scan, hash, check, upload                        */
+/*                                                                      */
+/* The scan (paths + stat only) runs on the main thread at startup; the */
+/* slow work — SHA1 hashing, the bulk dup-check and uploads — runs on a */
+/* second background thread so the UI never blocks. Item state lives in */
+/* the volatile g_local_state[] machine; the sync thread is the only    */
+/* writer except for the QUEUED handoff (main thread, guarded).         */
+/* ------------------------------------------------------------------ */
+
+/* build "YYYY-MM-DDTHH:MM:SS" (sortable) from a SceDateTime. fields are
+ * masked to their printed width so the output can never overrun out[] */
+static void datetime_sortable(const SceDateTime *t, char *out, size_t len)
+{
+	snprintf(out, len, "%04d-%02d-%02dT%02d:%02d:%02d",
+		 t->year % 10000, t->month % 100, t->day % 100,
+		 t->hour % 100, t->minute % 100, t->second % 100);
+}
+
+/* build ISO8601 with milliseconds + Z, as Immich's API expects */
+static void datetime_iso(const SceDateTime *t, char *out, size_t len)
+{
+	snprintf(out, len, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+		 t->year % 10000, t->month % 100, t->day % 100,
+		 t->hour % 100, t->minute % 100, t->second % 100);
+}
+
+static int ext_is(const char *name, const char *ext)
+{
+	size_t n = strlen(name), e = strlen(ext);
+	return n > e && !strcasecmp(name + n - e, ext);
+}
+
+static int is_media_name(const char *name, int *is_video)
+{
+	if (ext_is(name, ".jpg") || ext_is(name, ".jpeg") || ext_is(name, ".png")) {
+		*is_video = 0;
+		return 1;
+	}
+	if (ext_is(name, ".mp4")) {
+		*is_video = 1;
+		return 1;
+	}
+	return 0;
+}
+
+/* recurse a directory (up to depth levels) collecting camera media */
+static void scan_dir(const char *path, int depth)
+{
+	SceUID dfd = sceIoDopen(path);
+	if (dfd < 0) {
+		/* a safe (sandboxed) self gets an error here; the vpk must be
+		 * built UNSAFE and unsafe homebrew enabled in HENkaku settings */
+		log_line("scan: cannot open %s: 0x%08x", path, dfd);
+		return;
+	}
+
+	SceIoDirent ent;
+	memset(&ent, 0, sizeof(ent));
+	while (g_local_count < MAX_LOCAL && sceIoDread(dfd, &ent) > 0) {
+		if (ent.d_name[0] == '.')
+			continue;
+
+		/* build "path/name" by hand (bounded, no snprintf %s
+		 * truncation warning); skip anything too long to store */
+		size_t pl = strlen(path), nl = strlen(ent.d_name);
+		if (pl + 1 + nl + 1 > sizeof(g_local_path[0]))
+			continue;
+		char full[sizeof(g_local_path[0])];
+		memcpy(full, path, pl);
+		full[pl] = '/';
+		memcpy(full + pl + 1, ent.d_name, nl + 1);
+
+		/* some IO drivers report directory-ness only in st_attr */
+		if (SCE_S_ISDIR(ent.d_stat.st_mode) ||
+		    SCE_SO_ISDIR(ent.d_stat.st_attr)) {
+			if (depth > 0)
+				scan_dir(full, depth - 1);
+			continue;
+		}
+
+		int is_video;
+		if (!is_media_name(ent.d_name, &is_video))
+			continue;
+		if (!strcmp(full, VIDEO_TMP_PATH)) /* our own temp file */
+			continue;
+		if (g_syncmax_mb > 0 &&
+		    (long long)ent.d_stat.st_size > g_syncmax_mb * 1024LL * 1024LL) {
+			log_line("scan: skip %s (%lld MB > syncmaxmb=%ld)", full,
+				 (long long)ent.d_stat.st_size >> 20, g_syncmax_mb);
+			continue;
+		}
+
+		int j = g_local_count++;
+		memcpy(g_local_path[j], full, pl + 1 + nl + 1);
+		g_local_is_video[j] = is_video;
+		g_local_size[j] = (long long)ent.d_stat.st_size;
+		g_local_mtime[j] = ent.d_stat.st_mtime;
+		g_local_ctime[j] = ent.d_stat.st_ctime;
+		datetime_sortable(&ent.d_stat.st_mtime, g_local_date[j],
+				  sizeof(g_local_date[j]));
+		g_local_sha1[j][0] = '\0';
+		g_local_server_id[j][0] = '\0';
+		g_local_err[j][0] = '\0';
+		g_local_state[j] = SYNC_UNSCANNED;
+	}
+	sceIoDclose(dfd);
+	log_line("scan: %s: %d media so far", path, g_local_count);
+}
+
+/* scan the Vita's camera folders (main thread, fast: paths + stat only) */
+static int g_photo0_mounted;
+
+static void scan_local_media(void)
+{
+	g_local_count = 0;
+	if (g_syncdir_count > 0) {
+		for (int i = 0; i < g_syncdir_count; i++)
+			scan_dir(g_syncdirs[i], 3);
+	} else {
+		/* ux0:picture is ACL-protected (EPERM) even for unsafe
+		 * homebrew; the photo0: appdata mount is the sanctioned way
+		 * in. Camera videos live there too (the Photos app owns
+		 * them), so all of ux0:video — the movie collection — is
+		 * left alone. */
+		int mres = sceAppMgrAppDataMount(100, "photo0:");
+		g_photo0_mounted = (mres == 0);
+		log_line("scan: photo0 mount: 0x%08x", mres);
+		scan_dir(g_photo0_mounted ? "photo0:" : "ux0:picture", 3);
+		scan_dir("ux0:video/CAMERA", 3);
+	}
+	log_line("local scan: %d files", g_local_count);
+}
+
+static int sha1_file_hex(const char *path, char out[41])
+{
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return -1;
+	SHA_CTX c;
+	SHA1_Init(&c);
+	static unsigned char buf[64 * 1024]; /* big, keep off the stack */
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+		SHA1_Update(&c, buf, n);
+	int err = ferror(f);
+	fclose(f);
+	if (err)
+		return -1;
+	unsigned char d[20];
+	SHA1_Final(d, &c);
+	for (int i = 0; i < 20; i++)
+		snprintf(out + 2 * i, 3, "%02x", d[i]);
+	out[40] = '\0';
+	return 0;
+}
+
+static void sync_push_err(const char *fmt, ...)
+{
+	char buf[160];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	snprintf(g_sync_errlog[g_sync_errn % 5], 160, "%s", buf);
+	g_sync_errn++;
+	log_line("sync: %s", buf);
+}
+
+/* one curl handle reused by the sync thread (bulk-check + uploads) */
+static CURL *g_sync_curl;
+static struct curl_slist *g_sync_hdrs;
+
+static void sync_curl_init(void)
+{
+	g_sync_curl = curl_easy_init();
+	char keyhdr[300];
+	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	g_sync_hdrs = curl_slist_append(NULL, keyhdr);
+	curl_easy_setopt(g_sync_curl, CURLOPT_WRITEFUNCTION, write_cb);
+	curl_easy_setopt(g_sync_curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(g_sync_curl, CURLOPT_CONNECTTIMEOUT, 10L);
+	curl_easy_setopt(g_sync_curl, CURLOPT_USERAGENT, "vitaImmich/0.1 (PS Vita)");
+	curl_easy_setopt(g_sync_curl, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(g_sync_curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	if (g_resolve_list)
+		curl_easy_setopt(g_sync_curl, CURLOPT_RESOLVE, g_resolve_list);
+}
+
+/* parse a bulk-upload-check response: for each result, look up the local
+ * item by its id (we send the local index as the id) and set its state */
+static void parse_bulk_check(const char *js, size_t jslen)
+{
+	jsmn_parser parser;
+	jsmn_init(&parser);
+	int ntok = jsmn_parse(&parser, js, jslen, NULL, 0);
+	if (ntok <= 0)
+		return;
+	jsmntok_t *tok = malloc(sizeof(jsmntok_t) * ntok);
+	if (!tok)
+		return;
+	jsmn_init(&parser);
+	ntok = jsmn_parse(&parser, js, jslen, tok, ntok);
+	if (ntok <= 0) {
+		free(tok);
+		return;
+	}
+
+	/* walk objects, collecting id/action/reason/assetId per result */
+	int cur_obj = -1, li = -1;
+	char action[16], reason[24], assetid[40];
+	for (int i = 0; i <= ntok; i++) {
+		if (i == ntok || tok[i].type == JSMN_OBJECT) {
+			/* flush the previous object's result */
+			if (li >= 0 && li < g_local_count) {
+				if (!strcmp(action, "reject") &&
+				    !strcmp(reason, "duplicate")) {
+					snprintf(g_local_server_id[li], 40,
+						 "%s", assetid);
+					g_local_state[li] = SYNC_BACKED_UP;
+				} else {
+					/* accept, or a non-duplicate reject we
+					 * can still try to upload */
+					g_local_state[li] = SYNC_LOCAL_ONLY;
+				}
+				g_need_rebuild = 1;
+			}
+			if (i == ntok)
+				break;
+			cur_obj = i;
+			li = -1;
+			action[0] = reason[0] = assetid[0] = '\0';
+			continue;
+		}
+		if (tok[i].type != JSMN_STRING || tok[i].size != 1 ||
+		    tok[i].parent != cur_obj || i + 1 >= ntok)
+			continue;
+		int klen = tok[i].end - tok[i].start;
+		const char *k = js + tok[i].start;
+		jsmntok_t *v = &tok[i + 1];
+		int vlen = v->end - v->start;
+		const char *vs = js + v->start;
+		if (klen == 2 && !strncmp(k, "id", 2))
+			li = atoi(vs); /* we sent the local index */
+		else if (klen == 6 && !strncmp(k, "action", 6))
+			snprintf(action, sizeof(action), "%.*s", vlen, vs);
+		else if (klen == 6 && !strncmp(k, "reason", 6))
+			snprintf(reason, sizeof(reason), "%.*s", vlen, vs);
+		else if (klen == 7 && !strncmp(k, "assetId", 7))
+			snprintf(assetid, sizeof(assetid), "%.*s", vlen, vs);
+	}
+	free(tok);
+}
+
+/* bulk-upload-check a batch of CHECKING items (indices in idxs[0..n)) */
+static void bulk_check_batch(const int *idxs, int n)
+{
+	/* {"assets":[{"id":"<localidx>","checksum":"<hex>"},...]} */
+	size_t cap = 64 + n * 80;
+	char *body = malloc(cap);
+	if (!body)
+		return;
+	int off = snprintf(body, cap, "{\"assets\":[");
+	for (int i = 0; i < n; i++)
+		off += snprintf(body + off, cap - off,
+				"%s{\"id\":\"%d\",\"checksum\":\"%s\"}",
+				i ? "," : "", idxs[i], g_local_sha1[idxs[i]]);
+	off += snprintf(body + off, cap - off, "]}");
+
+	char url[600];
+	snprintf(url, sizeof(url), "%s/api/assets/bulk-upload-check", g_server);
+
+	struct curl_slist *hdrs = curl_slist_append(NULL, "Content-Type: application/json");
+	char keyhdr[300];
+	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	hdrs = curl_slist_append(hdrs, keyhdr);
+
+	membuf buf = { NULL, 0 };
+	curl_easy_setopt(g_sync_curl, CURLOPT_URL, url);
+	curl_easy_setopt(g_sync_curl, CURLOPT_HTTPHEADER, hdrs);
+	curl_easy_setopt(g_sync_curl, CURLOPT_POST, 1L);
+	curl_easy_setopt(g_sync_curl, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(g_sync_curl, CURLOPT_WRITEDATA, &buf);
+	curl_easy_setopt(g_sync_curl, CURLOPT_TIMEOUT, 60L);
+	CURLcode res = curl_easy_perform(g_sync_curl);
+	long code = 0;
+	if (res == CURLE_OK)
+		curl_easy_getinfo(g_sync_curl, CURLINFO_RESPONSE_CODE, &code);
+
+	if (res == CURLE_OK && code >= 200 && code < 300 && buf.data) {
+		parse_bulk_check(buf.data, buf.size);
+	} else {
+		/* leave them LOCAL_ONLY so the user can still try to upload */
+		for (int i = 0; i < n; i++)
+			g_local_state[idxs[i]] = SYNC_LOCAL_ONLY;
+		sync_push_err("dup-check failed (curl %d, HTTP %ld)", res, code);
+	}
+	g_need_rebuild = 1;
+
+	/* reset the handle for reuse (clear POSTFIELDS / restore defaults) */
+	curl_easy_setopt(g_sync_curl, CURLOPT_HTTPHEADER, NULL);
+	curl_easy_setopt(g_sync_curl, CURLOPT_POSTFIELDS, NULL);
+	curl_slist_free_all(hdrs);
+	free(buf.data);
+	free(body);
+}
+
+static int upload_xfer_cb(void *ud, curl_off_t dl, curl_off_t dln,
+			  curl_off_t ult, curl_off_t uln)
+{
+	g_ul_total = ult;
+	g_ul_now = uln;
+	return 0;
+}
+
+/* upload one local item; returns 0 on success, -1 on failure (err set) */
+static int upload_item(int j, char *err, size_t errlen)
+{
+	const char *path = g_local_path[j];
+	const char *name = strrchr(path, '/');
+	name = name ? name + 1 : path;
+
+	char created[40], modified[40], devid[300];
+	datetime_iso(&g_local_ctime[j], created, sizeof(created));
+	datetime_iso(&g_local_mtime[j], modified, sizeof(modified));
+	snprintf(devid, sizeof(devid), "%s-%lld", name, g_local_size[j]);
+
+	char url[600];
+	snprintf(url, sizeof(url), "%s/api/assets", g_server);
+
+	char keyhdr[300], sumhdr[80];
+	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	snprintf(sumhdr, sizeof(sumhdr), "x-immich-checksum: %s", g_local_sha1[j]);
+	struct curl_slist *hdrs = curl_slist_append(NULL, keyhdr);
+	hdrs = curl_slist_append(hdrs, sumhdr);
+	hdrs = curl_slist_append(hdrs, "Accept: application/json");
+
+	curl_mime *mime = curl_mime_init(g_sync_curl);
+	curl_mimepart *part;
+	part = curl_mime_addpart(mime);
+	curl_mime_name(part, "assetData");
+	curl_mime_filedata(part, path); /* streams from disk */
+	curl_mime_filename(part, name);
+	part = curl_mime_addpart(mime);
+	curl_mime_name(part, "deviceAssetId");
+	curl_mime_data(part, devid, CURL_ZERO_TERMINATED);
+	part = curl_mime_addpart(mime);
+	curl_mime_name(part, "deviceId");
+	curl_mime_data(part, "PS Vita", CURL_ZERO_TERMINATED);
+	part = curl_mime_addpart(mime);
+	curl_mime_name(part, "fileCreatedAt");
+	curl_mime_data(part, created, CURL_ZERO_TERMINATED);
+	part = curl_mime_addpart(mime);
+	curl_mime_name(part, "fileModifiedAt");
+	curl_mime_data(part, modified, CURL_ZERO_TERMINATED);
+	part = curl_mime_addpart(mime);
+	curl_mime_name(part, "filename");
+	curl_mime_data(part, name, CURL_ZERO_TERMINATED);
+
+	membuf buf = { NULL, 0 };
+	g_ul_now = g_ul_total = 0;
+	curl_easy_setopt(g_sync_curl, CURLOPT_URL, url);
+	curl_easy_setopt(g_sync_curl, CURLOPT_HTTPHEADER, hdrs);
+	curl_easy_setopt(g_sync_curl, CURLOPT_MIMEPOST, mime);
+	curl_easy_setopt(g_sync_curl, CURLOPT_WRITEDATA, &buf);
+	curl_easy_setopt(g_sync_curl, CURLOPT_TIMEOUT, 0L); /* big files */
+	curl_easy_setopt(g_sync_curl, CURLOPT_LOW_SPEED_LIMIT, 512L);
+	curl_easy_setopt(g_sync_curl, CURLOPT_LOW_SPEED_TIME, 60L);
+	curl_easy_setopt(g_sync_curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(g_sync_curl, CURLOPT_XFERINFOFUNCTION, upload_xfer_cb);
+
+	CURLcode res = curl_easy_perform(g_sync_curl);
+	long code = 0;
+	if (res == CURLE_OK)
+		curl_easy_getinfo(g_sync_curl, CURLINFO_RESPONSE_CODE, &code);
+
+	int rc = -1;
+	if (res != CURLE_OK) {
+		snprintf(err, errlen, "curl %d: %s", res, curl_easy_strerror(res));
+	} else if (code != 200 && code != 201) {
+		snprintf(err, errlen, "HTTP %ld: %.80s", code,
+			 buf.data ? buf.data : "");
+	} else {
+		/* parse {"id":"...","status":"created|duplicate"} */
+		const char *p = buf.data ? strstr(buf.data, "\"id\"") : NULL;
+		if (p) {
+			p = strchr(p + 4, '"');
+			if (p) {
+				p++;
+				int k = 0;
+				while (p[k] && p[k] != '"' && k < 39) {
+					g_local_server_id[j][k] = p[k];
+					k++;
+				}
+				g_local_server_id[j][k] = '\0';
+			}
+		}
+		rc = 0;
+	}
+
+	curl_easy_setopt(g_sync_curl, CURLOPT_MIMEPOST, NULL);
+	curl_easy_setopt(g_sync_curl, CURLOPT_NOPROGRESS, 1L);
+	curl_easy_setopt(g_sync_curl, CURLOPT_HTTPHEADER, NULL);
+	curl_mime_free(mime);
+	curl_slist_free_all(hdrs);
+	free(buf.data);
+	return rc;
+}
+
+/* the sync worker: hash everything, dup-check in batches, then drain the
+ * upload queue (items the user moved to QUEUED from the sync screen) */
+static int sync_thread(SceSize args, void *argp)
+{
+	sync_curl_init();
+
+	for (;;) {
+		/* 1. hash + dup-check a batch of freshly scanned files */
+		int batch[100], nb = 0;
+		for (int j = 0; j < g_local_count && nb < 100; j++) {
+			if (g_local_state[j] != SYNC_UNSCANNED)
+				continue;
+			const char *name = strrchr(g_local_path[j], '/');
+			name = name ? name + 1 : g_local_path[j];
+			g_sync_phase = 1;
+			snprintf(g_sync_activity, sizeof(g_sync_activity),
+				 "hashing %.120s", name);
+			g_local_state[j] = SYNC_HASHING;
+			if (sha1_file_hex(g_local_path[j], g_local_sha1[j]) != 0) {
+				snprintf(g_local_err[j], sizeof(g_local_err[j]),
+					 "hash failed");
+				g_local_state[j] = SYNC_FAILED;
+				sync_push_err("hash failed: %s", name);
+				continue;
+			}
+			g_local_state[j] = SYNC_CHECKING;
+			batch[nb++] = j;
+		}
+		if (nb > 0) {
+			g_sync_phase = 2;
+			snprintf(g_sync_activity, sizeof(g_sync_activity),
+				 "checking %d files on server", nb);
+			bulk_check_batch(batch, nb);
+			continue; /* loop back for the next batch */
+		}
+
+		/* 2. drain the upload queue */
+		int up = -1;
+		for (int j = 0; j < g_local_count; j++)
+			if (g_local_state[j] == SYNC_QUEUED) {
+				up = j;
+				break;
+			}
+		if (up >= 0) {
+			const char *name = strrchr(g_local_path[up], '/');
+			name = name ? name + 1 : g_local_path[up];
+			g_local_state[up] = SYNC_UPLOADING;
+			g_sync_phase = 3;
+			snprintf(g_sync_activity, sizeof(g_sync_activity),
+				 "uploading %.118s", name);
+			char err[96];
+			if (upload_item(up, err, sizeof(err)) == 0) {
+				g_local_state[up] = SYNC_BACKED_UP;
+			} else {
+				snprintf(g_local_err[up], sizeof(g_local_err[up]),
+					 "%s", err);
+				g_local_state[up] = SYNC_FAILED;
+				sync_push_err("upload %s: %s", name, err);
+			}
+			g_need_rebuild = 1;
+			continue;
+		}
+
+		/* nothing to do */
+		g_sync_phase = 0;
+		g_sync_activity[0] = '\0';
+		sceKernelDelayThread(50 * 1000);
+	}
+	return 0;
+}
+
+/* main thread: queue every LOCAL_ONLY item for upload (the QUEUED handoff,
+ * the one transition the main thread is allowed to make) */
+static int queue_all_uploads(void)
+{
+	int n = 0;
+	for (int j = 0; j < g_local_count; j++)
+		if (g_local_state[j] == SYNC_LOCAL_ONLY) {
+			g_local_state[j] = SYNC_QUEUED;
+			n++;
+		}
+	__sync_synchronize();
+	return n;
+}
+
+/* load a local photo full-size into a texture (main thread; reads the file
+ * then decodes with libjpeg / vita2d's PNG loader) */
+static vita2d_texture *load_local_image(int j, char *err, size_t errlen)
+{
+	FILE *f = fopen(g_local_path[j], "rb");
+	if (!f) {
+		snprintf(err, errlen, "open failed");
+		return NULL;
+	}
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	char *data = (sz > 0) ? malloc(sz + 1) : NULL;
+	if (!data) {
+		fclose(f);
+		snprintf(err, errlen, "out of memory (%ld bytes)", sz);
+		return NULL;
+	}
+	size_t got = fread(data, 1, sz, f);
+	data[got] = '\0';
+	fclose(f);
+
+	vita2d_texture *tex = NULL;
+	const unsigned char *p = (const unsigned char *)data;
+	if (got > 2 && p[0] == 0xff && p[1] == 0xd8) {
+		tex = decode_jpeg(data, got, FULL_MAX, err, errlen);
+	} else if (got > 8 && !memcmp(p, "\x89PNG", 4)) {
+		tex = vita2d_load_PNG_buffer(data);
+		if (!tex)
+			snprintf(err, errlen, "PNG decode failed");
+	} else {
+		snprintf(err, errlen, "unknown format");
+	}
+	free(data);
+	return tex;
+}
+
+/* ------------------------------------------------------------------ */
+/* grid status badges + sync overview                                  */
+/* ------------------------------------------------------------------ */
+
+/* small colour dot in the top-left corner of a grid cell; a backed-up
+ * item also gets a tiny white check, a local-only item an up-arrow */
+static void draw_status_badge(float bx, float by, int d, unsigned int frame)
+{
+	struct disp_item *it = &g_disp[d];
+	uint32_t col;
+	int kind; /* 0 none, 1 cloud, 2 local, 3 busy, 4 backed, 5 failed */
+
+	if (it->src == SRC_SERVER) {
+		kind = g_asset_local_backed[it->idx] ? 4 : 1;
+	} else {
+		switch (g_local_state[it->idx]) {
+		case SYNC_LOCAL_ONLY: kind = 2; break;
+		case SYNC_QUEUED:
+		case SYNC_UPLOADING:  kind = 3; break;
+		case SYNC_BACKED_UP:  kind = 4; break;
+		case SYNC_FAILED:     kind = 5; break;
+		default:              kind = 0; break; /* hashing/checking */
+		}
+	}
+	if (kind == 0)
+		return;
+
+	switch (kind) {
+	case 1: col = RGBA8(120, 150, 200, 255); break; /* cloud: blue-grey */
+	case 2: col = RGBA8(240, 160, 40, 255);  break; /* local: orange */
+	case 3: /* busy: blinking orange */
+		col = (frame / 20) & 1 ? RGBA8(240, 160, 40, 255)
+				       : RGBA8(120, 90, 30, 255);
+		break;
+	case 4: col = RGBA8(80, 200, 100, 255);  break; /* backed: green */
+	default: col = RGBA8(220, 70, 70, 255);  break; /* failed: red */
+	}
+
+	float cx = bx + 14, cy = by + 14, r = 9;
+	vita2d_draw_fill_circle(cx, cy, r + 2, RGBA8(0, 0, 0, 160));
+	vita2d_draw_fill_circle(cx, cy, r, col);
+
+	uint32_t w = RGBA8(255, 255, 255, 255);
+	if (kind == 4) { /* check mark */
+		vita2d_draw_rectangle(cx - 4, cy, 3, 5, w);
+		vita2d_draw_rectangle(cx - 2, cy + 2, 3, 3, w);
+		vita2d_draw_rectangle(cx, cy - 1, 3, 6, w);
+		vita2d_draw_rectangle(cx + 2, cy - 4, 3, 5, w);
+	} else if (kind == 2 || kind == 3) { /* up arrow */
+		vita2d_draw_rectangle(cx - 1, cy - 4, 3, 9, w);
+		vita2d_draw_rectangle(cx - 4, cy - 1, 3, 3, w);
+		vita2d_draw_rectangle(cx + 2, cy - 1, 3, 3, w);
+	}
+}
+
+/* count local items in a given state */
+static int count_state(int st)
+{
+	int n = 0;
+	for (int j = 0; j < g_local_count; j++)
+		if (g_local_state[j] == st)
+			n++;
+	return n;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
-enum { MODE_GRID, MODE_DETAIL };
+enum { MODE_GRID, MODE_DETAIL, MODE_SYNC };
 
 int main(void)
 {
@@ -1400,11 +2237,24 @@ int main(void)
 	if (worker >= 0)
 		sceKernelStartThread(worker, 0, NULL);
 
+	/* scan the Vita's own camera media (fast: paths + stat only), build
+	 * the merged timeline, then let the sync thread hash + dup-check it */
+	show_status("Scanning local media...");
+	scan_local_media();
+	rebuild_display();
+
+	SceUID syncw = sceKernelCreateThread("sync_worker", sync_thread,
+					     0x10000100, 256 * 1024, 0, 0, NULL);
+	if (syncw >= 0)
+		sceKernelStartThread(syncw, 0, NULL);
+
 	int mode = MODE_GRID;
+	int sync_return_mode = MODE_GRID;
 	int sel = 0;
 	float scroll = 0.0f, target = 0.0f;
 	unsigned int prev_buttons = 0;
 	unsigned int held_frames = 0;
+	unsigned int frame = 0;
 
 	vita2d_texture *detail_tex = NULL;
 	int detail_idx = -1;
@@ -1418,6 +2268,33 @@ int main(void)
 
 		if (pad.buttons & SCE_CTRL_START)
 			break;
+		frame++;
+
+		/* the sync thread asks us (the only writer of g_disp) to rebuild
+		 * the merged timeline after a status change; keep the selection
+		 * on the same photo across the reorder */
+		if (g_need_rebuild) {
+			g_need_rebuild = 0;
+			int had = (sel >= 0 && sel < g_disp_count);
+			struct disp_item keep = had ? g_disp[sel]
+						    : (struct disp_item){ 0, 0 };
+			rebuild_display();
+			if (had) {
+				int ns = find_disp(keep.src, keep.idx);
+				if (ns >= 0)
+					sel = ns;
+			}
+			if (sel >= g_disp_count)
+				sel = g_disp_count - 1;
+			detail_idx = -1; /* re-decode: item under sel may differ */
+		}
+
+		/* SELECT toggles the sync overview from the grid / detail view */
+		if ((pressed & SCE_CTRL_SELECT) && mode != MODE_SYNC) {
+			sync_return_mode = mode;
+			mode = MODE_SYNC;
+			continue;
+		}
 
 		/* d-pad auto-repeat for fast scrolling */
 		const unsigned int dirs = SCE_CTRL_UP | SCE_CTRL_DOWN |
@@ -1442,18 +2319,19 @@ int main(void)
 				sel -= COLS * 2;
 			if (sel < 0)
 				sel = 0;
-			if (sel >= g_asset_count)
-				sel = g_asset_count - 1;
+			if (sel >= g_disp_count)
+				sel = g_disp_count - 1;
 
 			if (pressed & SCE_CTRL_CROSS)
 				mode = MODE_DETAIL;
 
 			/* fetch the next page when selection nears the end */
 			if (g_next_page > 0 &&
-			    sel >= g_asset_count - COLS * 4) {
+			    sel >= g_disp_count - COLS * 4) {
 				show_status("Loading more photos... (%d so far)",
 					    g_asset_count);
-				fetch_page(0);
+				if (fetch_page(0) > 0)
+					rebuild_display();
 			}
 
 			/* scroll follows the selection */
@@ -1462,7 +2340,7 @@ int main(void)
 				target = sel_y;
 			if (sel_y + CELL_H > target + SCREEN_H)
 				target = sel_y + CELL_H - SCREEN_H;
-			int rows = (g_asset_count + COLS - 1) / COLS;
+			int rows = (g_disp_count + COLS - 1) / COLS;
 			float max_scroll = rows * CELL_H - SCREEN_H;
 			if (max_scroll < 0)
 				max_scroll = 0;
@@ -1474,26 +2352,33 @@ int main(void)
 
 			int first_vis = ((int)scroll / CELL_H) * COLS;
 			int last_vis = (((int)scroll + SCREEN_H) / CELL_H + 1) * COLS - 1;
-			if (last_vis >= g_asset_count)
-				last_vis = g_asset_count - 1;
+			if (last_vis >= g_disp_count)
+				last_vis = g_disp_count - 1;
 
 			/* evict thumbs far outside the viewport (never the one
 			 * the worker is currently loading); wait for the GPU
 			 * before the first free in case a recently drawn
 			 * texture is still referenced by an in-flight frame */
 			int waited = 0;
-			for (int i = 0; i < g_asset_count; i++) {
-				if (!g_thumb[i] ||
-				    (g_req_state != REQ_IDLE && i == g_req_idx))
-					continue;
+			for (int i = 0; i < g_disp_count; i++) {
 				float dy = (float)(i / COLS) * CELL_H - scroll;
-				if (dy < -2.5f * SCREEN_H || dy > 3.5f * SCREEN_H) {
+				if (disp_thumb(i) &&
+				    (dy < -2.5f * SCREEN_H || dy > 3.5f * SCREEN_H)) {
+					struct disp_item *it = &g_disp[i];
+					/* don't free a thumb the worker is filling */
+					if (g_req_state != REQ_IDLE &&
+					    g_req_idx == it->idx &&
+					    g_req_src == it->src)
+						continue;
 					if (!waited) {
 						vita2d_wait_rendering_done();
 						waited = 1;
 					}
-					vita2d_free_texture(g_thumb[i]);
-					g_thumb[i] = NULL;
+					vita2d_free_texture(disp_thumb(i));
+					if (it->src == SRC_LOCAL)
+						g_local_thumb[it->idx] = NULL;
+					else
+						g_thumb[it->idx] = NULL;
 				}
 			}
 
@@ -1506,7 +2391,8 @@ int main(void)
 			if (g_req_state == REQ_IDLE) {
 				int next = pick_next_load(sel, first_vis, last_vis);
 				if (next >= 0) {
-					g_req_idx = next;
+					g_req_idx = g_disp[next].idx;
+					g_req_src = g_disp[next].src;
 					__sync_synchronize();
 					g_req_state = REQ_PENDING;
 				}
@@ -1522,15 +2408,16 @@ int main(void)
 				float bw = CELL_W - 2 * CELL_PAD;
 				float bh = CELL_H - 2 * CELL_PAD;
 
-				if (g_thumb[i])
-					draw_texture_fitted(g_thumb[i], bx, by, bw, bh);
-				else if (g_thumb_failed[i])
+				vita2d_texture *th = disp_thumb(i);
+				if (th)
+					draw_texture_fitted(th, bx, by, bw, bh);
+				else if (disp_thumb_failed(i))
 					vita2d_draw_rectangle(bx, by, bw, bh,
 							      RGBA8(90, 30, 30, 255));
 				else
 					vita2d_draw_rectangle(bx, by, bw, bh,
 							      RGBA8(40, 40, 40, 255));
-				if (g_asset_is_video[i]) {
+				if (disp_is_video(i)) {
 					vita2d_draw_rectangle(bx, by + bh - 26,
 							      64, 26,
 							      RGBA8(0, 0, 0, 170));
@@ -1539,6 +2426,7 @@ int main(void)
 							     RGBA8(255, 255, 255, 255),
 							     0.85f, "VIDEO");
 				}
+				draw_status_badge(bx, by, i, frame);
 				if (i == sel)
 					draw_sel_outline(x + 2, y + 2,
 							 CELL_W - 4, CELL_H - 4);
@@ -1546,15 +2434,19 @@ int main(void)
 
 			char hud[160];
 			snprintf(hud, sizeof(hud),
-				 "%d / %d%s    %s    X view    START exit",
-				 sel + 1, g_asset_count, g_next_page > 0 ? "+" : "",
-				 g_asset_dates[sel]);
+				 "%d / %d%s    %.10s    X view  SELECT sync  START exit",
+				 sel + 1, g_disp_count, g_next_page > 0 ? "+" : "",
+				 g_disp_count > 0 ? disp_date(sel) : "");
 			draw_hud(hud);
 
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
-		} else { /* MODE_DETAIL */
-			if (nav & SCE_CTRL_RIGHT && sel < g_asset_count - 1)
+		} else if (mode == MODE_DETAIL) {
+			struct disp_item it = g_disp[sel];
+			int is_local = (it.src == SRC_LOCAL);
+			int is_video = disp_is_video(sel);
+
+			if (nav & SCE_CTRL_RIGHT && sel < g_disp_count - 1)
 				sel++;
 			if (nav & SCE_CTRL_LEFT && sel > 0)
 				sel--;
@@ -1565,8 +2457,11 @@ int main(void)
 			if (pressed & SCE_CTRL_CROSS) {
 				if (detail_failed) {
 					detail_idx = -1; /* retry */
-				} else if (g_asset_is_video[sel]) {
-					view_video(sel);
+				} else if (is_video) {
+					if (is_local)
+						play_video_file(g_local_path[it.idx]);
+					else
+						view_video(it.idx);
 					/* wait for the buttons used inside the
 					 * player to be released, so they don't
 					 * also act on this screen */
@@ -1579,6 +2474,13 @@ int main(void)
 				}
 			}
 
+			/* left/right may have moved the selection; refresh the
+			 * item we load + draw below (the X handler above acted
+			 * on the item shown when the frame started) */
+			it = g_disp[sel];
+			is_local = (it.src == SRC_LOCAL);
+			is_video = disp_is_video(sel);
+
 			if (detail_idx != sel) {
 				if (detail_tex) {
 					/* the GPU may still be drawing the
@@ -1587,10 +2489,25 @@ int main(void)
 					vita2d_free_texture(detail_tex);
 					detail_tex = NULL;
 				}
-				show_status("Loading photo %d/%d ...",
-					    sel + 1, g_asset_count);
-				detail_tex = load_image(sel, FULL_MAX);
-				detail_failed = (detail_tex == NULL);
+				if (is_video) {
+					/* nothing to decode; X plays it */
+					detail_tex = NULL;
+					detail_failed = 0;
+				} else {
+					show_status("Loading photo %d/%d ...",
+						    sel + 1, g_disp_count);
+					if (is_local) {
+						char e[160];
+						detail_tex = load_local_image(it.idx,
+									      e, sizeof(e));
+						if (!detail_tex)
+							log_line("local %s: %s",
+								 g_local_path[it.idx], e);
+					} else {
+						detail_tex = load_image(it.idx, FULL_MAX);
+					}
+					detail_failed = (detail_tex == NULL);
+				}
 				detail_idx = sel;
 			}
 
@@ -1600,16 +2517,103 @@ int main(void)
 			if (detail_tex)
 				draw_texture_fitted(detail_tex, 0, 0,
 						    SCREEN_W, SCREEN_H);
+			else if (is_video)
+				draw_centered(SCREEN_H / 2,
+					      RGBA8(200, 200, 200, 255),
+					      "Press X to play this video");
+			else if (it.src == SRC_SERVER)
+				draw_error_detail(it.idx);
 			else
-				draw_error_detail(sel);
+				draw_centered(SCREEN_H / 2,
+					      RGBA8(255, 80, 80, 255),
+					      "Failed to load this photo");
 
 			const char *xhint = detail_failed ? "X retry    " :
-					    g_asset_is_video[sel] ? "X play    " : "";
+					    is_video ? "X play    " : "";
 			char hud[160];
 			snprintf(hud, sizeof(hud),
-				 "%d / %d    %s    < > browse    %sO back    START exit",
-				 sel + 1, g_asset_count, g_asset_dates[sel], xhint);
+				 "%d / %d    %.19s    < > browse    %sO back    START exit",
+				 sel + 1, g_disp_count,
+				 g_disp_count > 0 ? disp_date(sel) : "", xhint);
 			draw_hud(hud);
+
+			vita2d_end_drawing();
+			vita2d_swap_buffers();
+		} else { /* MODE_SYNC */
+			if ((pressed & SCE_CTRL_CIRCLE) ||
+			    (pressed & SCE_CTRL_SELECT)) {
+				mode = sync_return_mode;
+				detail_idx = -1; /* re-decode on return to detail */
+				continue;
+			}
+			if (pressed & SCE_CTRL_CROSS) {
+				int q = queue_all_uploads();
+				log_line("sync: queued %d uploads", q);
+			}
+
+			int backed = count_state(SYNC_BACKED_UP);
+			int local_only = count_state(SYNC_LOCAL_ONLY);
+			int queued = count_state(SYNC_QUEUED) +
+				     count_state(SYNC_UPLOADING);
+			int failed = count_state(SYNC_FAILED);
+			int pending = count_state(SYNC_UNSCANNED) +
+				      count_state(SYNC_HASHING) +
+				      count_state(SYNC_CHECKING);
+
+			vita2d_start_drawing();
+			vita2d_clear_screen();
+
+			draw_centered(40, RGBA8(255, 255, 255, 255), "Sync overview");
+
+			char line[200];
+			int y = 96;
+			uint32_t c = RGBA8(220, 220, 220, 255);
+			snprintf(line, sizeof(line), "Server assets fetched: %d%s",
+				 g_asset_count, g_next_page > 0 ? " (more)" : "");
+			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 34;
+			snprintf(line, sizeof(line), "Local camera files:    %d",
+				 g_local_count);
+			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 34;
+			snprintf(line, sizeof(line),
+				 "backed up %d   local-only %d   queued/uploading %d",
+				 backed, local_only, queued);
+			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 34;
+			snprintf(line, sizeof(line), "scanning/hashing %d   failed %d",
+				 pending, failed);
+			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 40;
+
+			/* current activity + upload progress */
+			if (g_sync_activity[0]) {
+				if (g_sync_phase == 3 && g_ul_total > 0) {
+					float frac = (float)g_ul_now / (float)g_ul_total;
+					snprintf(line, sizeof(line), "%s  %.0f%%",
+						 g_sync_activity, frac * 100.0f);
+				} else {
+					snprintf(line, sizeof(line), "%s",
+						 g_sync_activity);
+				}
+				vita2d_pgf_draw_text(g_font, 60, y,
+						     RGBA8(120, 200, 120, 255),
+						     1.0f, line);
+			}
+			y += 44;
+
+			if (g_sync_errn > 0) {
+				vita2d_pgf_draw_text(g_font, 60, y,
+						     RGBA8(220, 120, 120, 255),
+						     1.0f, "Recent errors:");
+				y += 30;
+				int shown = g_sync_errn < 5 ? g_sync_errn : 5;
+				for (int k = 0; k < shown && y < 480; k++) {
+					int e = (g_sync_errn - shown + k) % 5;
+					vita2d_pgf_draw_text(g_font, 60, y,
+							     RGBA8(200, 160, 160, 255),
+							     0.9f, g_sync_errlog[e]);
+					y += 26;
+				}
+			}
+
+			draw_hud("X upload all local-only    O / SELECT back    START exit");
 
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
@@ -1622,9 +2626,14 @@ int main(void)
 	for (int i = 0; i < g_asset_count; i++)
 		if (g_thumb[i])
 			vita2d_free_texture(g_thumb[i]);
+	for (int i = 0; i < g_local_count; i++)
+		if (g_local_thumb[i])
+			vita2d_free_texture(g_local_thumb[i]);
 	vita2d_free_pgf(g_font);
 	vita2d_fini();
 	curl_global_cleanup();
+	if (g_photo0_mounted)
+		sceAppMgrUmount("photo0:");
 	sceKernelExitProcess(0);
 	return 0;
 }

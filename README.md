@@ -62,6 +62,7 @@ Grid view:
 | D-pad         | Move selection (hold to repeat) |
 | L / R         | Jump two rows up / down         |
 | X             | Open item full screen           |
+| SELECT        | Open the sync overview          |
 | START         | Exit                            |
 
 Full-screen view:
@@ -71,7 +72,16 @@ Full-screen view:
 | Left / Right  | Previous / next item              |
 | X             | Play video / retry a failed photo |
 | O             | Back to grid                      |
+| SELECT        | Open the sync overview            |
 | START         | Exit                              |
+
+Sync overview (SELECT):
+
+| Button        | Action                              |
+| ------------- | ----------------------------------- |
+| X             | Queue all local-only files to upload|
+| O / SELECT    | Back                                |
+| START         | Exit                                |
 
 Video playback:
 
@@ -85,6 +95,33 @@ More of the library is fetched automatically (100 photos at a time, newest
 first) as you scroll toward the end. Errors are shown on screen and logged
 to `ux0:data/vitaimmich/log.txt`.
 
+## Syncing the Vita's camera media
+
+On startup the app mounts the Photos app's storage (`photo0:`, i.e. the
+ACL-protected `ux0:picture` where camera shots and recordings live) via
+`sceAppMgrAppDataMount`, scans it (plus `ux0:video/CAMERA`, a few levels
+deep; `.jpg/.jpeg/.png/.mp4`) and merges those files into the same
+date-sorted grid as your server library.
+Files larger than 512 MB are skipped so a movie collection in `ux0:video`
+is never hashed or offered for upload. Both knobs live in `config.txt`:
+`syncdir=<folder>` (repeatable, replaces the default scan locations) and
+`syncmaxmb=<MB>` (the size cap; 0 disables it).
+A small badge in the top-left corner of each cell shows its status:
+
+- blue-grey dot — **cloud only** (a server asset not present on the Vita)
+- orange up-arrow — **local only** (on the Vita, not yet on the server)
+- blinking orange — **queued / uploading**
+- green check — **backed up** (exists on both; shown once, as the server asset)
+- red dot — **failed** (see the sync overview for the reason)
+
+A background thread hashes each local file (SHA1) and asks the server which
+ones already exist (`POST /api/assets/bulk-upload-check`). Hashing and the
+duplicate check start automatically. Uploads do **not** start on their own:
+open the sync overview with **SELECT** and press **X** to queue every
+local-only file. Each upload is a `POST /api/assets` multipart request with
+an `x-immich-checksum` header for fast server-side dedup; progress is shown
+in the overview.
+
 ## PoC limitations
 
 - TLS certificate verification is disabled (no CA bundle is shipped), so
@@ -97,4 +134,15 @@ to `ux0:data/vitaimmich/log.txt`.
   SceAvPlayer, so only MP4 (H.264/AAC) plays — Immich's transcoded
   `video/playback` stream is used, which is H.264 with default server
   settings.
-- Caps at 1000 assets per launch; no albums, search or upload.
+- Caps at 1000 server assets and 500 local camera files per launch; no
+  albums or search.
+- Local media sync is one-way (Vita → server). It scans `ux0:picture` and
+  `ux0:video/CAMERA` by default (the standard camera locations), recursing
+  ~2 levels; use `syncdir=` in the config to scan other folders.
+- Local videos have no poster-frame thumbnail (the Vita has no still
+  decoder for arbitrary MP4 frames), so their grid cell is a dark
+  placeholder with the VIDEO badge; opening one still plays it.
+- Hashing 500 files at startup takes a while; it runs in the background so
+  browsing is never blocked, but statuses fill in gradually.
+- `deviceId` is hard-coded to "PS Vita" and uploads are not associated with
+  an album.
