@@ -133,15 +133,18 @@ in the overview.
   and a moment to start. Playback uses the Vita's hardware decoder via
   SceAvPlayer, so only MP4 (H.264/AAC) plays — Immich's transcoded
   `video/playback` stream is used, which is H.264 with default server
-  settings.
+  settings. The decoder rotates four output frame buffers (~13 MB CDRAM at
+  1080p) so async GPU rendering can't be torn by a recycled frame.
 - Caps at 1000 server assets and 500 local camera files per launch; no
   albums or search.
 - Local media sync is one-way (Vita → server). It scans `ux0:picture` and
   `ux0:video/CAMERA` by default (the standard camera locations), recursing
   ~2 levels; use `syncdir=` in the config to scan other folders.
-- Local videos have no poster-frame thumbnail (the Vita has no still
-  decoder for arbitrary MP4 frames), so their grid cell is a dark
-  placeholder with the VIDEO badge; opening one still plays it.
+- Local video grid cells show a poster thumbnail (with the VIDEO badge):
+  the first frame is decoded with SceAvPlayer on the background loader
+  thread (NV12 -> RGB, downscaled), the same handoff as photos. Poster
+  extraction and playback share the single hardware decoder, so a poster is
+  never decoded while a video is playing (and vice versa).
 - Hashing 500 files at startup takes a while; it runs in the background so
   browsing is never blocked, but statuses fill in gradually.
 - `deviceId` is hard-coded to "PS Vita" and uploads are not associated with

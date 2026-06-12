@@ -851,6 +851,21 @@ static int g_req_w, g_req_h, g_req_comps;
 static char *g_req_raw;            /* raw body when it's a PNG */
 static size_t g_req_raw_size;
 
+/* SceAvPlayer + the hardware video decoder must never run two instances at
+ * once. g_player_active is owned by play_video_file (main thread); the worker
+ * sets g_poster_active around video-poster extraction. The two sides use a
+ * fixed lock order: each sets its own flag, then tests the other's (the worker
+ * backs off if the player won; play_video_file only ever waits, bounded). The
+ * one that set its flag first is seen by the other, so a mutual wait — main
+ * blocked on the worker while the worker is blocked on main — cannot occur. */
+static volatile int g_player_active;
+static volatile int g_poster_active;
+
+/* extract the first frame of a local MP4 as a packed RGB888 thumbnail;
+ * defined down in the video section, worker-thread safe (no vita2d calls) */
+static unsigned char *extract_video_poster(const char *path, int *w, int *h,
+					   char *err, size_t errlen);
+
 static int worker_thread(SceSize args, void *argp)
 {
 	CURL *curl = curl_easy_init();
@@ -884,6 +899,34 @@ static int worker_thread(SceSize args, void *argp)
 			g_local_path[idx] : g_asset_ids[idx];
 		g_req_pix = NULL;
 		g_req_raw = NULL;
+
+		/* local videos have no JPEG to read: decode a poster frame
+		 * instead. guard against a concurrently playing video — set
+		 * our flag first, then yield while the player holds the
+		 * decoder (lock order mirrors play_video_file, see above). */
+		if (src == SRC_LOCAL && g_local_is_video[idx]) {
+			g_poster_active = 1;
+			__sync_synchronize();
+			while (g_player_active) {
+				g_poster_active = 0;
+				__sync_synchronize();
+				sceKernelDelayThread(50 * 1000);
+				g_poster_active = 1;
+				__sync_synchronize();
+			}
+			g_req_pix = extract_video_poster(g_local_path[idx],
+							 &g_req_w, &g_req_h,
+							 err, errlen);
+			if (g_req_pix)
+				g_req_comps = 3;
+			g_poster_active = 0;
+			__sync_synchronize();
+			if (!g_req_pix)
+				log_line("thumb %s: %s", label, err);
+			__sync_synchronize();
+			g_req_state = REQ_DONE;
+			continue;
+		}
 
 		membuf buf = { NULL, 0 };
 		long code = 0;
@@ -1047,12 +1090,10 @@ static int disp_thumb_failed(int d)
 				    : g_thumb_failed[it->idx];
 }
 
-/* local videos have no poster frame, so the loader never requests them
- * (a dark placeholder cell is drawn instead) */
+/* request a thumb for anything not yet loaded or failed; local videos get a
+ * poster frame extracted on the worker thread, same as photos */
 static int disp_wants_thumb(int d)
 {
-	if (g_disp[d].src == SRC_LOCAL && g_local_is_video[g_disp[d].idx])
-		return 0;
 	return !disp_thumb(d) && !disp_thumb_failed(d);
 }
 
@@ -1372,6 +1413,159 @@ static void av_gpu_free(void *p, void *ptr)
 		sceKernelFreeMemBlock(mb);
 }
 
+/* load the SceAvPlayer module once. shared by playback and poster extraction
+ * (either thread can be the first to need it); returns 0 once loaded, or a
+ * negative module error. a second load returns ALREADY_LOADED, so the latch
+ * keeps that from being mistaken for a failure. */
+static volatile int g_avplayer_loaded;
+
+static int load_avplayer_module(void)
+{
+	if (g_avplayer_loaded)
+		return 0;
+	int mret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
+	log_line("video: load AVPLAYER module: 0x%08x", mret);
+	if (mret < 0)
+		return mret;
+	g_avplayer_loaded = 1;
+	return 0;
+}
+
+/* Extract the first video frame of an MP4 as a tightly-packed RGB888 buffer,
+ * nearest-neighbour downscaled so the long side is <= THUMB_MAX. Runs on the
+ * WORKER thread: no vita2d/GXM drawing, only SceAvPlayer + the av_gpu_alloc
+ * memblock helper (which the architecture permits off the main thread).
+ * Returns a malloc'd buffer (caller frees) with w/h set, or NULL on failure
+ * (err set, and the failing avplayer step logged). */
+static unsigned char *extract_video_poster(const char *path, int *w, int *h,
+					   char *err, size_t errlen)
+{
+	if (load_avplayer_module() < 0) {
+		snprintf(err, errlen, "avplayer module load failed");
+		log_line("poster %s: module load failed", path);
+		return NULL;
+	}
+
+	SceAvPlayerInitData init;
+	memset(&init, 0, sizeof(init));
+	init.memoryReplacement.allocate          = av_alloc;
+	init.memoryReplacement.deallocate        = av_free;
+	init.memoryReplacement.allocateTexture   = av_gpu_alloc;
+	init.memoryReplacement.deallocateTexture = av_gpu_free;
+	init.basePriority = 0xA0;
+	init.numOutputVideoFrameBuffers = 2;
+	init.autoStart = 1;
+	init.defaultLanguage = "eng";
+
+	/* like play_video_file: the handle is a context pointer, init failure
+	 * is 0/NULL rather than a negative error */
+	SceAvPlayerHandle avp = sceAvPlayerInit(&init);
+	if (avp == 0) {
+		snprintf(err, errlen, "sceAvPlayerInit returned NULL");
+		log_line("poster %s: sceAvPlayerInit returned NULL", path);
+		return NULL;
+	}
+	int ret = sceAvPlayerAddSource(avp, path);
+	if (ret < 0) {
+		snprintf(err, errlen, "sceAvPlayerAddSource 0x%08x", ret);
+		log_line("poster %s: sceAvPlayerAddSource 0x%08x", path, ret);
+		sceAvPlayerClose(avp);
+		return NULL;
+	}
+
+	/* the source parses asynchronously; wait ~5 s for it to become active */
+	int active = 0;
+	for (int i = 0; i < 500 && !(active = sceAvPlayerIsActive(avp)); i++)
+		sceKernelDelayThread(10 * 1000);
+	if (!active) {
+		snprintf(err, errlen, "never became active (codec?)");
+		log_line("poster %s: never became active", path);
+		sceAvPlayerStop(avp);
+		sceAvPlayerClose(avp);
+		return NULL;
+	}
+
+	/* poll ~5 s for the first decoded frame */
+	SceAvPlayerFrameInfo frame;
+	int got = 0;
+	for (int i = 0; i < 500; i++) {
+		memset(&frame, 0, sizeof(frame));
+		if (sceAvPlayerGetVideoData(avp, &frame)) {
+			got = 1;
+			break;
+		}
+		if (!sceAvPlayerIsActive(avp))
+			break;
+		sceKernelDelayThread(10 * 1000);
+	}
+	if (!got) {
+		snprintf(err, errlen, "no video frame");
+		log_line("poster %s: sceAvPlayerGetVideoData timed out", path);
+		sceAvPlayerStop(avp);
+		sceAvPlayerClose(avp);
+		return NULL;
+	}
+
+	int sw = (int)frame.details.video.width;
+	int sh = (int)frame.details.video.height;
+	if (sw <= 0 || sh <= 0) {
+		snprintf(err, errlen, "bad frame size %dx%d", sw, sh);
+		log_line("poster %s: bad frame size %dx%d", path, sw, sh);
+		sceAvPlayerStop(avp);
+		sceAvPlayerClose(avp);
+		return NULL;
+	}
+
+	/* integer downscale step so the long side lands <= THUMB_MAX */
+	int step = 1;
+	while ((sw > sh ? sw : sh) / step > THUMB_MAX)
+		step++;
+	int dw = sw / step, dh = sh / step;
+	if (dw < 1) dw = 1;
+	if (dh < 1) dh = 1;
+
+	unsigned char *rgb = malloc((size_t)dw * dh * 3);
+	if (!rgb) {
+		snprintf(err, errlen, "out of memory (%dx%d)", dw, dh);
+		log_line("poster %s: out of memory (%dx%d)", path, dw, dh);
+		sceAvPlayerStop(avp);
+		sceAvPlayerClose(avp);
+		return NULL;
+	}
+
+	/* NV12: Y plane (sw*sh bytes), then interleaved U,V at half resolution
+	 * (row pitch sw, one U,V pair per 2x2 luma block). nearest-neighbour
+	 * sample + integer BT.601 YUV->RGB. byte order matches decode_jpeg_buf
+	 * (R,G,B), which the U8U8U8_BGR texture in consume_worker_result wants. */
+	const unsigned char *yp = (const unsigned char *)frame.pData;
+	const unsigned char *uvp = yp + (size_t)sw * sh;
+	unsigned char *o = rgb;
+	for (int dy = 0; dy < dh; dy++) {
+		int sy = dy * step;
+		const unsigned char *yrow = yp + (size_t)sy * sw;
+		const unsigned char *uvrow = uvp + (size_t)(sy / 2) * sw;
+		for (int dx = 0; dx < dw; dx++) {
+			int sx = dx * step;
+			int Y = yrow[sx];
+			int U = uvrow[(sx & ~1)];
+			int V = uvrow[(sx & ~1) + 1];
+			int C = Y - 16, D = U - 128, E = V - 128;
+			int R = (298 * C + 409 * E + 128) >> 8;
+			int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
+			int B = (298 * C + 516 * D + 128) >> 8;
+			*o++ = R < 0 ? 0 : R > 255 ? 255 : R;
+			*o++ = G < 0 ? 0 : G > 255 ? 255 : G;
+			*o++ = B < 0 ? 0 : B > 255 ? 255 : B;
+		}
+	}
+
+	*w = dw;
+	*h = dh;
+	sceAvPlayerStop(avp);
+	sceAvPlayerClose(avp);
+	return rgb;
+}
+
 static SceAvPlayerHandle g_avp;
 static volatile int g_av_audio_run;
 
@@ -1411,20 +1605,22 @@ static int video_audio_thread(SceSize args, void *argp)
 /* play a local MP4 full screen; returns when it ends or O is pressed */
 static void play_video_file(const char *path)
 {
-	static int avplayer_module_loaded;
-	if (!avplayer_module_loaded) {
-		int mret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
-		log_line("video: load AVPLAYER module: 0x%08x", mret);
-		if (mret < 0) {
-			char det[64];
-			snprintf(det, sizeof(det), "sceSysmoduleLoadModule: 0x%08x",
-				 mret);
-			show_blocking_error("Could not load the video player module",
-					    det);
-			return;
-		}
-		avplayer_module_loaded = 1;
+	if (load_avplayer_module() < 0) {
+		show_blocking_error("Could not load the video player module",
+				    "sceSysmoduleLoadModule failed");
+		return;
 	}
+
+	/* claim the hardware decoder: announce ourselves, then wait (bounded,
+	 * ~12 s — longer than extraction's worst-case timeouts) for any
+	 * in-flight worker poster extraction to finish. lock-order mirror of
+	 * the worker guard — we set our flag before waiting, so the worker
+	 * sees it and backs off; we only ever wait here, never hold a lock
+	 * the worker is also waiting on, so the two cannot deadlock. */
+	g_player_active = 1;
+	__sync_synchronize();
+	for (int i = 0; i < 720 && g_poster_active; i++)
+		show_status("Starting video...");
 
 	SceAvPlayerInitData init;
 	memset(&init, 0, sizeof(init));
@@ -1433,7 +1629,10 @@ static void play_video_file(const char *path)
 	init.memoryReplacement.allocateTexture   = av_gpu_alloc;
 	init.memoryReplacement.deallocateTexture = av_gpu_free;
 	init.basePriority = 0xA0;
-	init.numOutputVideoFrameBuffers = 2;
+	/* four rotating frame buffers (not two): GPU rendering is async, so two
+	 * let the decoder recycle a buffer the GPU is still sampling, which
+	 * tears/glitches. 1080p NV12 is ~3.2 MB/buffer, so 4 ~= 13 MB CDRAM. */
+	init.numOutputVideoFrameBuffers = 4;
 	init.autoStart = 1;
 	init.defaultLanguage = "eng";
 
@@ -1444,6 +1643,8 @@ static void play_video_file(const char *path)
 		log_line("video: sceAvPlayerInit failed");
 		show_blocking_error("Could not start the video player",
 				    "sceAvPlayerInit returned NULL");
+		g_player_active = 0;
+		__sync_synchronize();
 		return;
 	}
 	log_line("video: player handle 0x%08x", g_avp);
@@ -1454,6 +1655,8 @@ static void play_video_file(const char *path)
 		log_line("video: %s", det);
 		sceAvPlayerClose(g_avp);
 		show_blocking_error("Could not open the video file", det);
+		g_player_active = 0;
+		__sync_synchronize();
 		return;
 	}
 
@@ -1478,10 +1681,13 @@ static void play_video_file(const char *path)
 			duration = sinfo.duration;
 	}
 
-	/* double-buffered frame wrappers: while the GPU still samples one
-	 * frame the decoder may already be filling the other */
-	vita2d_texture vtex[2];
-	SceAvPlayerFrameInfo vframe[2];
+	/* four rotating frame wrappers (matching numOutputVideoFrameBuffers):
+	 * while the GPU still samples one frame the decoder fills another, and
+	 * the deeper ring keeps it from reusing a buffer that is still in flight.
+	 * the wrappers never own memory (the decoder's CDRAM buffers do), so we
+	 * must never vita2d_free_texture them. */
+	vita2d_texture vtex[4];
+	SceAvPlayerFrameInfo vframe[4];
 	memset(vtex, 0, sizeof(vtex));
 	memset(vframe, 0, sizeof(vframe));
 	int buf_idx = 0;
@@ -1526,7 +1732,7 @@ static void play_video_file(const char *path)
 						vframe[buf_idx].details.video.height,
 						0);
 			cur = &vtex[buf_idx];
-			buf_idx ^= 1;
+			buf_idx = (buf_idx + 1) & 3;
 		}
 
 		vita2d_start_drawing();
@@ -1564,6 +1770,10 @@ static void play_video_file(const char *path)
 	vita2d_wait_rendering_done();
 	sceAvPlayerStop(g_avp);
 	sceAvPlayerClose(g_avp);
+
+	/* release the decoder so the worker can resume poster extraction */
+	g_player_active = 0;
+	__sync_synchronize();
 }
 
 /* download + play asset idx, cleaning up the temp file afterwards */
