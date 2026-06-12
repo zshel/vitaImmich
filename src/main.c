@@ -52,10 +52,9 @@
 #define SCREEN_W 960
 #define SCREEN_H 544
 
-#define COLS       4
-#define CELL_W     240
-#define CELL_H     240
-#define CELL_PAD   6
+#define COLS       5     /* rough items per row, for prefetch distances only */
+#define ROW_H      200   /* justified-grid row height; widths follow aspect */
+#define CELL_PAD   3
 #define HEADER_H   40            /* month/year band height in the grid */
 #define THUMB_MAX  256   /* decode grid thumbs down to <= this dimension */
 #define FULL_MAX   4096  /* GXM texture size limit */
@@ -91,6 +90,7 @@ static vita2d_pgf *g_font;
  * buffers), so a realloc here can't dangle a pointer under it. */
 static char (*g_asset_ids)[40];
 static char (*g_asset_dates)[DATELEN]; /* YYYY-MM-DDTHH:MM:SS */
+static float *g_asset_ratio;           /* display w/h from exif, 0 = unknown */
 static unsigned char *g_asset_is_video;
 /* set during display rebuild: a backed-up local file matches this server
  * asset, so its grid cell shows the green "backed up" badge */
@@ -147,10 +147,14 @@ static struct disp_item *g_disp;
 static int g_disp_count;
 static int g_disp_cap;
 
-/* per-display-slot grid layout (filled by layout_grid): pixel position of the
- * cell, plus the month/year section headers shown above each month's run */
+/* per-display-slot grid layout (filled by layout_grid): pixel position and
+ * width/height of the cell (justified rows: width follows the photo's
+ * aspect, the row is stretched to span the full screen width), plus the
+ * month/year section headers above each month's run */
 static float *g_item_x;
 static float *g_item_y;
+static float *g_item_w;
+static float *g_item_h;
 struct sect_hdr { float y; char label[24]; };
 static struct sect_hdr *g_sect;
 static int g_sect_count;
@@ -214,6 +218,7 @@ static int grow_assets(int need)
 		return 1;
 	if (!GROW(g_asset_ids, c, need) ||
 	    !GROW(g_asset_dates, c, need) ||
+	    !GROW(g_asset_ratio, c, need) ||
 	    !GROW(g_asset_is_video, c, need) ||
 	    !GROW(g_asset_local_backed, c, need) ||
 	    !GROW(g_thumb, c, need) ||
@@ -253,6 +258,8 @@ static int grow_disp(int need)
 		return 1;
 	if (!GROW(g_disp, c, need) ||
 	    !GROW(g_item_x, c, need) ||
+	    !GROW(g_item_w, c, need) ||
+	    !GROW(g_item_h, c, need) ||
 	    !(g_disp_cap = GROW(g_item_y, c, need)))
 		return 0;
 	return 1;
@@ -787,30 +794,57 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 	}
 
 	/* walk tokens in document order; keys whose parent is the current
-	 * top-level object belong to that asset (nested objects have a
-	 * different parent, so owner.id etc. are skipped) */
+	 * top-level object belong to that asset (exifInfo is the one nested
+	 * object we descend into, for the photo's display aspect ratio) */
 	int added = 0;
-	int cur = -1, cur_obj = -1;
+	int cur = -1, cur_obj = -1, exif_obj = -1;
+	int exw = 0, exh = 0, exori = 0;
 	for (int i = arr_idx + 1; i < ntok; i++) {
 		if (tok[i].type == JSMN_OBJECT && tok[i].parent == arr_idx) {
+			if (cur >= 0 && exw > 0 && exh > 0)
+				g_asset_ratio[cur] = (exori >= 5 && exori <= 8) ?
+					(float)exh / exw : (float)exw / exh;
 			if (!grow_assets(g_asset_count + 1))
 				break; /* out of memory: keep what we have */
 			cur = g_asset_count++;
 			cur_obj = i;
+			exif_obj = -1;
+			exw = exh = exori = 0;
 			added++;
 			g_asset_ids[cur][0] = '\0';
 			g_asset_dates[cur][0] = '\0';
+			g_asset_ratio[cur] = 0.0f;
 			g_asset_is_video[cur] = 0;
 			continue;
 		}
 		if (cur < 0 || tok[i].type != JSMN_STRING || tok[i].size != 1 ||
-		    tok[i].parent != cur_obj || i + 1 >= ntok)
+		    i + 1 >= ntok)
 			continue;
 
 		int klen = tok[i].end - tok[i].start;
 		const char *k = js + tok[i].start;
 		jsmntok_t *val = &tok[i + 1];
 		int vlen = val->end - val->start;
+
+		if (tok[i].parent == exif_obj) {
+			/* numbers may also arrive as strings; atoi covers both
+			 * and yields 0 on null */
+			if (klen == 14 && !strncmp(k, "exifImageWidth", 14))
+				exw = atoi(js + val->start);
+			else if (klen == 15 && !strncmp(k, "exifImageHeight", 15))
+				exh = atoi(js + val->start);
+			else if (klen == 11 && !strncmp(k, "orientation", 11))
+				exori = atoi(js + val->start);
+			continue;
+		}
+		if (tok[i].parent != cur_obj)
+			continue;
+
+		if (klen == 8 && !strncmp(k, "exifInfo", 8) &&
+		    val->type == JSMN_OBJECT) {
+			exif_obj = i + 1;
+			continue;
+		}
 		if (val->type != JSMN_STRING)
 			continue;
 
@@ -828,6 +862,9 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 			g_asset_is_video[cur] =
 				(vlen == 5 && !strncmp(js + val->start, "VIDEO", 5));
 	}
+	if (cur >= 0 && exw > 0 && exh > 0)
+		g_asset_ratio[cur] = (exori >= 5 && exori <= 8) ?
+			(float)exh / exw : (float)exw / exh;
 	free(tok);
 
 	/* drop trailing entries that somehow lack an id */
@@ -848,7 +885,7 @@ static int fetch_page(int is_first)
 	snprintf(url, sizeof(url), "%s/api/search/metadata", g_server);
 	char body[128];
 	snprintf(body, sizeof(body),
-		 "{\"page\":%d,\"size\":%d,\"order\":\"desc\"}",
+		 "{\"page\":%d,\"size\":%d,\"order\":\"desc\",\"withExif\":true}",
 		 g_next_page, PAGE_SIZE);
 
 	membuf buf;
@@ -890,7 +927,11 @@ static int fetch_page(int is_first)
 
 	/* a short page means we reached the end of the library */
 	g_next_page = (added == PAGE_SIZE) ? g_next_page + 1 : 0;
-	log_line("page fetched: +%d assets (total %d)", added, g_asset_count);
+	int with_ratio = 0;
+	for (int i = g_asset_count - added; i < g_asset_count; i++)
+		with_ratio += (g_asset_ratio[i] > 0.0f);
+	log_line("page fetched: +%d assets (total %d, %d with exif ratio)",
+		 added, g_asset_count, with_ratio);
 	return added;
 }
 
@@ -1291,14 +1332,51 @@ static void month_label(const char *date, char *out, size_t len)
 		snprintf(out, len, "%s %d", mon[m], y);
 }
 
-/* compute each display slot's grid cell + the month/year header bands. the
- * timeline is already date-desc sorted, so a run of equal "YYYY-MM" is one
- * month; every month starts on a fresh row under its own header. */
+/* display aspect ratio (w/h) of a slot; local camera media and assets the
+ * server reported no exif for fall back to 4:3 */
+static float disp_ratio(int d)
+{
+	struct disp_item *it = &g_disp[d];
+	float r = (it->src == SRC_SERVER) ? g_asset_ratio[it->idx] : 0.0f;
+	return r > 0.0f ? r : 4.0f / 3.0f;
+}
+
+/* place row items [start, end) at *y. when justifying, the whole row is
+ * scaled so it spans the full screen width (the row height grows with it,
+ * capped so a sparse row can't blow up); a month's trailing partial row
+ * stays at its natural size, left-aligned. */
+static void layout_finish_row(int start, int end, float *y, float natw,
+			      int justify)
+{
+	float scale = 1.0f;
+	if (justify && natw > 0.0f) {
+		scale = (float)SCREEN_W / natw;
+		if (scale > 1.55f)
+			scale = 1.55f;
+	}
+	float h = ROW_H * scale;
+	float x = 0.0f;
+	for (int i = start; i < end; i++) {
+		g_item_x[i] = x;
+		g_item_y[i] = *y;
+		g_item_w[i] *= scale;
+		g_item_h[i] = h;
+		x += g_item_w[i];
+	}
+	*y += h;
+}
+
+/* compute each display slot's grid cell + the month/year header bands.
+ * justified rows like the Immich web timeline: each item's width follows
+ * its aspect ratio, a row wraps when the next item no longer fits, and the
+ * closed row is stretched to fill the full screen width. the timeline is
+ * date-desc sorted, so a run of equal "YYYY-MM" is one month; every month
+ * starts on a fresh row under its own header. */
 static void layout_grid(void)
 {
 	g_sect_count = 0;
-	float y = 0.0f;
-	int col = 0;
+	float y = 0.0f, natw = 0.0f;
+	int row_start = 0;
 	char curkey[8] = "";
 
 	for (int d = 0; d < g_disp_count; d++) {
@@ -1307,10 +1385,10 @@ static void layout_grid(void)
 		snprintf(key, sizeof(key), "%.7s", date); /* YYYY-MM */
 
 		if (strcmp(key, curkey) != 0) {
-			if (col != 0) { /* finish the partial last row */
-				y += CELL_H;
-				col = 0;
-			}
+			if (d > row_start) /* month's partial last row */
+				layout_finish_row(row_start, d, &y, natw, 0);
+			row_start = d;
+			natw = 0.0f;
 			if (grow_sect(g_sect_count + 1)) {
 				g_sect[g_sect_count].y = y;
 				month_label(date, g_sect[g_sect_count].label,
@@ -1321,15 +1399,21 @@ static void layout_grid(void)
 			snprintf(curkey, sizeof(curkey), "%s", key);
 		}
 
-		g_item_x[d] = (float)col * CELL_W;
-		g_item_y[d] = y;
-		if (++col == COLS) {
-			col = 0;
-			y += CELL_H;
+		float w = ROW_H * disp_ratio(d);
+		if (w < ROW_H * 0.4f)
+			w = ROW_H * 0.4f;  /* keep extreme portraits tappable */
+		if (w > SCREEN_W)
+			w = SCREEN_W;      /* panoramas: one per row */
+		if (natw > 0.0f && natw + w > SCREEN_W) {
+			layout_finish_row(row_start, d, &y, natw, 1);
+			row_start = d;
+			natw = 0.0f;
 		}
+		g_item_w[d] = w; /* natural width; scaled when the row closes */
+		natw += w;
 	}
-	if (col != 0)
-		y += CELL_H;
+	if (g_disp_count > row_start)
+		layout_finish_row(row_start, g_disp_count, &y, natw, 0);
 	g_content_h = y;
 }
 
@@ -1411,11 +1495,43 @@ static int item_at(float x, float wy)
 	for (int i = 0; i < g_disp_count; i++) {
 		if (g_item_y[i] > wy)
 			break; /* item y is non-decreasing */
-		if (wy < g_item_y[i] + CELL_H &&
-		    x >= g_item_x[i] && x < g_item_x[i] + CELL_W)
+		if (wy < g_item_y[i] + g_item_h[i] &&
+		    x >= g_item_x[i] && x < g_item_x[i] + g_item_w[i])
 			return i;
 	}
 	return -1;
+}
+
+/* move the selection one row up (dir<0) or down (dir>0), landing on the
+ * item whose cell is horizontally nearest — rows hold a variable number
+ * of items now, so the fixed columns arithmetic no longer applies */
+static int nav_row(int sel, int dir)
+{
+	if (sel < 0 || sel >= g_disp_count)
+		return sel;
+	float cy = g_item_y[sel];
+	float cx = g_item_x[sel] + g_item_w[sel] / 2.0f;
+	int i = sel;
+	/* step off the current row */
+	while (i + dir >= 0 && i + dir < g_disp_count &&
+	       g_item_y[i] == cy)
+		i += dir;
+	if (g_item_y[i] == cy)
+		return sel; /* already on the first/last row */
+	/* pick the horizontally nearest item of that row */
+	float ry = g_item_y[i];
+	int best = i;
+	float bestd = -1.0f;
+	for (; i >= 0 && i < g_disp_count && g_item_y[i] == ry; i += dir) {
+		float d = g_item_x[i] + g_item_w[i] / 2.0f - cx;
+		if (d < 0)
+			d = -d;
+		if (bestd < 0 || d < bestd) {
+			bestd = d;
+			best = i;
+		}
+	}
+	return best;
 }
 
 /* display slot nearest a world-y (used to keep the selection inside the
@@ -1424,7 +1540,7 @@ static int item_near(float wy)
 {
 	int last = -1;
 	for (int i = 0; i < g_disp_count; i++) {
-		if (g_item_y[i] + CELL_H > wy)
+		if (g_item_y[i] + g_item_h[i] > wy)
 			return i;
 		last = i;
 	}
@@ -1457,6 +1573,27 @@ static int pick_next_load(int sel, int first_vis, int last_vis)
 		if (disp_wants_thumb(i))
 			return i;
 	return -1;
+}
+
+/* hand the worker a thumbnail request for display slot d (g_req_state must
+ * be REQ_IDLE); local videos get their poster extracted */
+static void req_issue_thumb(int d)
+{
+	struct disp_item *ti = &g_disp[d];
+	g_req_idx = ti->idx;
+	g_req_src = ti->src;
+	g_req_detail = 0;
+	if (ti->src == SRC_LOCAL) {
+		snprintf(g_req_path, sizeof(g_req_path), "%s",
+			 g_local_path[ti->idx]);
+		g_req_is_video = g_local_is_video[ti->idx];
+	} else {
+		snprintf(g_req_id, sizeof(g_req_id), "%s",
+			 g_asset_ids[ti->idx]);
+		g_req_is_video = 0;
+	}
+	__sync_synchronize();
+	g_req_state = REQ_PENDING;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1519,6 +1656,22 @@ static void draw_hud(const char *text)
 			     RGBA8(255, 255, 255, 255), 1.0f, text);
 }
 
+/* translucent play button over a video's poster in the detail view */
+static void draw_play_overlay(void)
+{
+	float cx = SCREEN_W / 2.0f, cy = SCREEN_H / 2.0f;
+	vita2d_draw_fill_circle(cx, cy, 46.0f, RGBA8(20, 20, 20, 150));
+	vita2d_color_vertex *v =
+		vita2d_pool_memalign(3 * sizeof(*v), sizeof(*v));
+	if (!v)
+		return;
+	unsigned int col = RGBA8(255, 255, 255, 220);
+	v[0] = (vita2d_color_vertex){ cx - 14.0f, cy - 24.0f, 0.5f, col };
+	v[1] = (vita2d_color_vertex){ cx - 14.0f, cy + 24.0f, 0.5f, col };
+	v[2] = (vita2d_color_vertex){ cx + 28.0f, cy, 0.5f, col };
+	vita2d_draw_array(SCE_GXM_PRIMITIVE_TRIANGLES, v, 3);
+}
+
 static void draw_error_detail(int idx)
 {
 	draw_centered(220, RGBA8(255, 80, 80, 255), "Failed to load this photo");
@@ -1570,6 +1723,25 @@ static size_t file_write_cb(void *ptr, size_t size, size_t nmemb, void *ud)
 }
 
 static uint64_t g_dl_last_draw;
+/* poster/thumb drawn behind the download progress and the player's startup
+ * (the seconds AVPlayer spends parsing before the first frame); set by the
+ * play call sites, valid for the whole modal download + playback */
+static vita2d_texture *g_dl_bg;
+
+/* full-screen status with the video's poster behind it */
+static void show_video_status(const char *text)
+{
+	vita2d_start_drawing();
+	vita2d_clear_screen();
+	if (g_dl_bg) {
+		draw_texture_fitted(g_dl_bg, 0, 0, SCREEN_W, SCREEN_H);
+		vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H,
+				      RGBA8(0, 0, 0, 130));
+	}
+	draw_centered(SCREEN_H / 2, RGBA8(255, 255, 255, 255), text);
+	vita2d_end_drawing();
+	vita2d_swap_buffers();
+}
 
 static int dl_progress_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
 			  curl_off_t ultotal, curl_off_t ulnow)
@@ -1595,6 +1767,12 @@ static int dl_progress_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
 
 	vita2d_start_drawing();
 	vita2d_clear_screen();
+	if (g_dl_bg) {
+		/* the video's poster behind the progress, dimmed */
+		draw_texture_fitted(g_dl_bg, 0, 0, SCREEN_W, SCREEN_H);
+		vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H,
+				      RGBA8(0, 0, 0, 130));
+	}
 	draw_centered(SCREEN_H / 2 - 20, RGBA8(255, 255, 255, 255), buf);
 	if (dltotal > 0) {
 		float frac = (float)dlnow / (float)dltotal;
@@ -1931,7 +2109,7 @@ static void play_video_file(const char *path)
 	g_player_active = 1;
 	__sync_synchronize();
 	for (int i = 0; i < 720 && g_poster_active; i++)
-		show_status("Starting video...");
+		show_video_status("Starting video...");
 
 	/* replay re-inits the player from the same (already-local) file, so the
 	 * decoder claim above is taken once and held across replays. */
@@ -1988,7 +2166,7 @@ replay:
 	/* AddSource parses asynchronously; give it ~5 s to start */
 	int active = 0;
 	for (int i = 0; i < 300 && !(active = sceAvPlayerIsActive(g_avp)); i++)
-		show_status("Starting video...");
+		show_video_status("Starting video...");
 
 	/* AddSource parses asynchronously, so the stream duration is usually not
 	 * available yet at this point; keep re-querying it in the loop below until
@@ -2056,6 +2234,9 @@ replay:
 		vita2d_clear_screen();
 		if (cur)
 			draw_texture_fitted(cur, 0, 0, SCREEN_W, SCREEN_H);
+		else if (g_dl_bg)
+			/* poster until the first decoded frame arrives */
+			draw_texture_fitted(g_dl_bg, 0, 0, SCREEN_W, SCREEN_H);
 
 		if (duration == 0) {
 			SceAvPlayerStreamInfo sinfo;
@@ -2136,6 +2317,12 @@ replay:
 /* download + play asset idx, cleaning up the temp file afterwards */
 static void view_video(int idx)
 {
+	/* the video's poster behind the download progress; the detail view
+	 * pre-sets its sharper full-res poster, the grid falls back to the
+	 * asset thumb. the modal download keeps the texture alive. */
+	if (!g_dl_bg)
+		g_dl_bg = g_thumb[idx];
+
 	char err[160];
 	int r = download_video(idx, err, sizeof(err));
 	if (r == 0) {
@@ -2145,6 +2332,7 @@ static void view_video(int idx)
 		log_line("video %s: %s", g_asset_ids[idx], err);
 		show_blocking_error("Failed to download video", err);
 	}
+	g_dl_bg = NULL;
 	sceIoRemove(VIDEO_TMP_PATH);
 }
 
@@ -2864,12 +3052,28 @@ int main(void)
 	int detail_issued = 0;   /* the worker request has been handed over */
 	float zoom = 1.0f, panx = 0.0f, pany = 0.0f;
 
-	/* front-touch state (grid: drag scrolls, tap opens) */
+	/* front-touch state (grid: drag scrolls, tap opens; detail: swipe
+	 * changes photo, drag pans when zoomed) */
 	int touch_active = 0;   /* finger currently down */
 	int touch_dragged = 0;  /* moved past the tap threshold */
 	float touch_x = 0, touch_y = 0;       /* last position, screen px */
-	float touch_start_y = 0, touch_start_scroll = 0;
+	float touch_start_x = 0, touch_start_y = 0, touch_start_scroll = 0;
+	float touch_panx0 = 0, touch_pany0 = 0; /* pan at touch start (zoomed) */
 	float touch_vel = 0;    /* px/frame at the moment of release */
+
+	/* detail-view photo slide: the current photo's horizontal offset.
+	 * a swipe maps it 1:1 to the finger; on release (or d-pad browse) it
+	 * animates to +-SCREEN_W, the selection switches, and the neighbor's
+	 * thumbnail rides alongside the whole way. */
+	float slide_x = 0, slide_goal = 0;
+	int slide_anim = 0;
+
+	/* detail-view neighbor prefetch: while the current photo is settled,
+	 * the worker quietly fetches the full-res images (or video posters)
+	 * of sel+1 / sel-1 so browsing lands sharp instantly */
+	vita2d_texture *pf_tex[2] = { NULL, NULL };
+	int pf_d[2] = { -1, -1 };  /* display slot each cache slot holds */
+	int pf_pending = -1;       /* slot being fetched right now, -1 none */
 
 	for (;;) {
 		SceCtrlData pad;
@@ -2898,6 +3102,16 @@ int main(void)
 			if (sel >= g_disp_count)
 				sel = g_disp_count - 1;
 			detail_idx = -1; /* re-decode: item under sel may differ */
+			/* display slots were reshuffled: the prefetch cache's
+			 * slot keys are meaningless now */
+			for (int k = 0; k < 2; k++) {
+				if (pf_tex[k]) {
+					vita2d_wait_rendering_done();
+					vita2d_free_texture(pf_tex[k]);
+					pf_tex[k] = NULL;
+				}
+				pf_d[k] = -1;
+			}
 		}
 
 		/* SELECT toggles the sync overview from the grid / detail view */
@@ -2920,14 +3134,14 @@ int main(void)
 				sel++;
 			if (nav & SCE_CTRL_LEFT)
 				sel--;
-			if (nav & SCE_CTRL_DOWN)
-				sel += COLS;
-			if (nav & SCE_CTRL_UP)
-				sel -= COLS;
 			if (sel < 0)
 				sel = 0;
 			if (sel >= g_disp_count)
 				sel = g_disp_count - 1;
+			if (nav & SCE_CTRL_DOWN)
+				sel = nav_row(sel, +1);
+			if (nav & SCE_CTRL_UP)
+				sel = nav_row(sel, -1);
 			if (pressed & SCE_CTRL_RTRIGGER)
 				sel = month_jump(sel, +1); /* older month */
 			if (pressed & SCE_CTRL_LTRIGGER)
@@ -2953,27 +3167,14 @@ int main(void)
 			int scrolling_fast = (grid_settle < 12);
 
 			if (pressed & SCE_CTRL_CROSS) {
-				if (g_disp_count > 0 && disp_is_video(sel)) {
-					/* videos start loading/playing right
-					 * away; no "press X to play" stop */
-					struct disp_item it = g_disp[sel];
-					if (it.src == SRC_LOCAL)
-						play_video_file(g_local_path[it.idx]);
-					else
-						view_video(it.idx);
-					/* wait for the player's buttons to be
-					 * released so they don't also act on
-					 * the grid */
-					do {
-						sceCtrlPeekBufferPositive(0, &pad, 1);
-						sceKernelDelayThread(10 * 1000);
-					} while (pad.buttons);
-					prev_buttons = 0;
-					continue;
-				}
+				/* photos and videos both open the detail
+				 * view; a video shows its poster with the
+				 * play button there */
 				mode = MODE_DETAIL;
 				zoom = 1.0f;
 				panx = pany = 0.0f;
+				slide_x = slide_goal = 0;
+				slide_anim = 0;
 			}
 
 			/* fetch the next page when the selection settles near the
@@ -3031,27 +3232,18 @@ int main(void)
 				} else if (touch_active) {
 					touch_active = 0;
 					if (!touch_dragged) {
-						/* tap: open the item under it */
+						/* tap: open the item under it
+						 * (videos show their poster +
+						 * play button in the detail) */
 						int i = item_at(touch_x,
 								touch_y + scroll);
 						if (i >= 0) {
 							sel = i;
-							if (disp_is_video(i)) {
-								struct disp_item ti = g_disp[i];
-								if (ti.src == SRC_LOCAL)
-									play_video_file(g_local_path[ti.idx]);
-								else
-									view_video(ti.idx);
-								do {
-									sceCtrlPeekBufferPositive(0, &pad, 1);
-									sceKernelDelayThread(10 * 1000);
-								} while (pad.buttons);
-								prev_buttons = 0;
-								continue;
-							}
 							mode = MODE_DETAIL;
 							zoom = 1.0f;
 							panx = pany = 0.0f;
+							slide_x = slide_goal = 0;
+							slide_anim = 0;
 						}
 					} else if (touch_vel > 2.0f ||
 						   touch_vel < -2.0f) {
@@ -3078,8 +3270,10 @@ int main(void)
 				      g_item_y[sel] : 0.0f;
 			if (sel_y - HEADER_H < target)
 				target = sel_y - HEADER_H;
-			if (sel_y + CELL_H > target + SCREEN_H)
-				target = sel_y + CELL_H - SCREEN_H;
+			float sel_h = (sel >= 0 && sel < g_disp_count) ?
+				      g_item_h[sel] : ROW_H;
+			if (sel_y + sel_h > target + SCREEN_H)
+				target = sel_y + sel_h - SCREEN_H;
 			float max_scroll = g_content_h - SCREEN_H;
 			if (max_scroll < 0)
 				max_scroll = 0;
@@ -3098,7 +3292,7 @@ int main(void)
 			 * are recycled through the pool, see tex_release */
 			for (int i = 0; i < g_disp_count; i++) {
 				float dy = g_item_y[i] - scroll;
-				if (dy > -CELL_H && dy < SCREEN_H) {
+				if (dy > -g_item_h[i] && dy < SCREEN_H) {
 					if (first_vis < 0)
 						first_vis = i;
 					last_vis = i;
@@ -3178,8 +3372,8 @@ int main(void)
 				float x = g_item_x[i];
 				float y = g_item_y[i] - scroll;
 				float bx = x + CELL_PAD, by = y + CELL_PAD;
-				float bw = CELL_W - 2 * CELL_PAD;
-				float bh = CELL_H - 2 * CELL_PAD;
+				float bw = g_item_w[i] - 2 * CELL_PAD;
+				float bh = g_item_h[i] - 2 * CELL_PAD;
 
 				vita2d_texture *th = disp_thumb(i);
 				if (th)
@@ -3202,7 +3396,8 @@ int main(void)
 				draw_status_badge(bx, by, i, frame);
 				if (i == sel)
 					draw_sel_outline(x + 2, y + 2,
-							 CELL_W - 4, CELL_H - 4);
+							 g_item_w[i] - 4,
+							 g_item_h[i] - 4);
 			}
 
 			char hud[160];
@@ -3246,11 +3441,106 @@ int main(void)
 				if (pad.buttons & SCE_CTRL_LEFT)  panx += 12.0f;
 				if (pad.buttons & SCE_CTRL_UP)    pany += 12.0f;
 				if (pad.buttons & SCE_CTRL_DOWN)  pany -= 12.0f;
-			} else {
-				if (nav & SCE_CTRL_RIGHT && sel < g_disp_count - 1)
-					sel++;
-				if (nav & SCE_CTRL_LEFT && sel > 0)
-					sel--;
+			} else if (!slide_anim && !touch_active) {
+				/* browse with a slide animation; the selection
+				 * switches when the slide completes */
+				if (nav & SCE_CTRL_RIGHT && sel < g_disp_count - 1) {
+					slide_anim = 1;
+					slide_goal = -SCREEN_W;
+				}
+				if (nav & SCE_CTRL_LEFT && sel > 0) {
+					slide_anim = 1;
+					slide_goal = SCREEN_W;
+				}
+			}
+
+			/* front touch: when zoomed a drag pans the photo 1:1;
+			 * otherwise a horizontal swipe drags the photo (and its
+			 * neighbor) 1:1 and a release past the threshold flips
+			 * to it, anything less springs back */
+			{
+				SceTouchData td;
+				sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
+				if (td.reportNum > 0) {
+					float tx = td.report[0].x * 0.5f;
+					float ty = td.report[0].y * 0.5f;
+					if (!touch_active) {
+						touch_active = 1;
+						touch_dragged = 0;
+						touch_start_x = tx;
+						touch_start_y = ty;
+						touch_panx0 = panx;
+						touch_pany0 = pany;
+					} else {
+						float dx = tx - touch_start_x;
+						float dy = ty - touch_start_y;
+						if (!touch_dragged &&
+						    (dx > 12.0f || dx < -12.0f ||
+						     dy > 12.0f || dy < -12.0f))
+							touch_dragged = 1;
+						if (touch_dragged && zoomed) {
+							panx = touch_panx0 + dx;
+							pany = touch_pany0 + dy;
+						} else if (touch_dragged &&
+							   !slide_anim) {
+							slide_x = dx;
+							/* nothing beyond the ends */
+							if (sel <= 0 && slide_x > 0)
+								slide_x = 0;
+							if (sel >= g_disp_count - 1 &&
+							    slide_x < 0)
+								slide_x = 0;
+						}
+					}
+					touch_x = tx;
+					touch_y = ty;
+				} else if (touch_active) {
+					touch_active = 0;
+					if (touch_dragged && !zoomed && !slide_anim) {
+						if (slide_x < -SCREEN_W / 4.0f &&
+						    sel < g_disp_count - 1)
+							slide_goal = -SCREEN_W;
+						else if (slide_x > SCREEN_W / 4.0f &&
+							 sel > 0)
+							slide_goal = SCREEN_W;
+						else
+							slide_goal = 0; /* spring back */
+						slide_anim = 1;
+					} else if (!touch_dragged && is_video &&
+						   !slide_anim) {
+						/* tap on the poster plays it */
+						g_dl_bg = detail_tex ?
+							detail_tex :
+							disp_thumb(sel);
+						if (is_local)
+							play_video_file(g_local_path[it.idx]);
+						else
+							view_video(it.idx);
+						g_dl_bg = NULL;
+						do {
+							sceCtrlPeekBufferPositive(0, &pad, 1);
+							sceKernelDelayThread(10 * 1000);
+						} while (pad.buttons);
+						prev_buttons = 0;
+						continue;
+					}
+				}
+			}
+
+			/* run the slide animation; at the end the selection
+			 * moves and the (centered) neighbor becomes current */
+			if (slide_anim && !touch_active) {
+				slide_x += (slide_goal - slide_x) * 0.35f;
+				float dd = slide_goal - slide_x;
+				if (dd < 4.0f && dd > -4.0f) {
+					if (slide_goal < -1.0f && sel < g_disp_count - 1)
+						sel++;
+					else if (slide_goal > 1.0f && sel > 0)
+						sel--;
+					slide_x = 0;
+					slide_goal = 0;
+					slide_anim = 0;
+				}
 			}
 			if (pressed & SCE_CTRL_CIRCLE) {
 				/* back to the grid; if a full-res load is in
@@ -3258,16 +3548,28 @@ int main(void)
 				mode = MODE_GRID;
 				detail_idx = -1;
 				detail_loading = 0;
+				slide_x = slide_goal = 0;
+				slide_anim = 0;
+				for (int k = 0; k < 2; k++) {
+					if (pf_tex[k]) {
+						vita2d_wait_rendering_done();
+						vita2d_free_texture(pf_tex[k]);
+						pf_tex[k] = NULL;
+					}
+					pf_d[k] = -1;
+				}
 				continue;
 			}
 			if (pressed & SCE_CTRL_CROSS) {
-				if (detail_failed) {
-					detail_idx = -1; /* retry */
-				} else if (is_video) {
+				if (is_video) {
+					/* play even if the poster fetch failed */
+					g_dl_bg = detail_tex ?
+						detail_tex : disp_thumb(sel);
 					if (is_local)
 						play_video_file(g_local_path[it.idx]);
 					else
 						view_video(it.idx);
+					g_dl_bg = NULL;
 					/* wait for the buttons used inside the
 					 * player to be released, so they don't
 					 * also act on this screen */
@@ -3278,6 +3580,8 @@ int main(void)
 					prev_buttons = 0;
 					continue;
 				}
+				if (detail_failed)
+					detail_idx = -1; /* retry */
 			}
 
 			/* left/right may have moved the selection; refresh the
@@ -3286,6 +3590,29 @@ int main(void)
 			it = g_disp[sel];
 			is_local = (it.src == SRC_LOCAL);
 			is_video = disp_is_video(sel);
+
+			/* collect a finished neighbor prefetch (and drop it
+			 * if browsing already moved past its neighborhood) */
+			if (pf_pending >= 0 && g_req_state == REQ_DONE) {
+				__sync_synchronize();
+				vita2d_texture *t = consume_detail_result();
+				int keep = (pf_pending == sel - 1 ||
+					    pf_pending == sel + 1 ||
+					    pf_pending == sel);
+				if (t && keep) {
+					int slot = pf_tex[0] ? 1 : 0;
+					if (pf_tex[slot]) {
+						vita2d_wait_rendering_done();
+						vita2d_free_texture(pf_tex[slot]);
+					}
+					pf_tex[slot] = t;
+					pf_d[slot] = pf_pending;
+				} else if (t) {
+					vita2d_wait_rendering_done();
+					vita2d_free_texture(t);
+				}
+				pf_pending = -1;
+			}
 
 			if (detail_idx != sel) {
 				zoom = 1.0f; /* reset view for the new photo */
@@ -3298,22 +3625,53 @@ int main(void)
 					detail_tex = NULL;
 				}
 				detail_failed = 0;
-				/* photos load asynchronously on the worker;
-				 * the blown-up grid thumb shows meanwhile and
-				 * O stays responsive (videos: X plays) */
-				detail_loading = !is_video;
+				/* photos (and server videos, whose poster is
+				 * the same preview endpoint) load async on the
+				 * worker; the blown-up grid thumb shows
+				 * meanwhile and O stays responsive */
+				detail_loading = (!is_video ||
+						  it.src == SRC_SERVER);
 				detail_issued = 0;
 				detail_idx = sel;
+				/* prefetched? take it and skip the load */
+				for (int k = 0; k < 2; k++) {
+					if (pf_d[k] == sel && pf_tex[k]) {
+						detail_tex = pf_tex[k];
+						pf_tex[k] = NULL;
+						pf_d[k] = -1;
+						detail_loading = 0;
+					}
+				}
+				/* drop cache entries no longer adjacent */
+				for (int k = 0; k < 2; k++) {
+					if (pf_d[k] >= 0 &&
+					    (pf_d[k] < sel - 1 ||
+					     pf_d[k] > sel + 1)) {
+						vita2d_wait_rendering_done();
+						vita2d_free_texture(pf_tex[k]);
+						pf_tex[k] = NULL;
+						pf_d[k] = -1;
+					}
+				}
 			}
 
 			/* drive the async full-res load */
 			if (detail_loading) {
 				if (!detail_issued) {
-					if (g_req_state == REQ_DONE) {
+					if (pf_pending < 0 &&
+					    g_req_state == REQ_DONE) {
 						__sync_synchronize();
 						consume_worker_result();
 					}
-					if (g_req_state == REQ_IDLE) {
+					if (g_req_state == REQ_IDLE &&
+					    disp_wants_thumb(sel)) {
+						/* no low-res preview at all yet
+						 * (opened mid-scroll): fetch the
+						 * quick thumb first so something
+						 * shows; the full-res request
+						 * follows right after */
+						req_issue_thumb(sel);
+					} else if (g_req_state == REQ_IDLE) {
 						g_req_idx = it.idx;
 						g_req_src = it.src;
 						g_req_detail = 1;
@@ -3336,17 +3694,116 @@ int main(void)
 					detail_loading = 0;
 					detail_failed = (detail_tex == NULL);
 				}
+			} else if (pf_pending < 0) {
+				/* a stale detail result (the user moved on
+				 * while it was in flight) would wedge the
+				 * request slot: discard it */
+				if (g_req_state == REQ_DONE) {
+					__sync_synchronize();
+					consume_worker_result();
+				}
+				if (g_req_state != REQ_IDLE ||
+				    slide_anim || touch_active)
+					goto pf_skip;
+				/* the current item's own thumb first (e.g. a
+				 * local video opened before its poster was
+				 * extracted), then the neighbors': their grid
+				 * thumbs are what the slide shows and what
+				 * fills the screen the instant a swipe lands.
+				 * the full-res prefetch follows. */
+				if (disp_wants_thumb(sel)) {
+					req_issue_thumb(sel);
+					goto pf_skip; /* request slot taken */
+				}
+				int want[2] = { sel + 1, sel - 1 };
+				for (int k = 0; k < 2; k++) {
+					int t = want[k];
+					if (t < 0 || t >= g_disp_count)
+						continue;
+					if (!disp_wants_thumb(t))
+						continue;
+					req_issue_thumb(t);
+					goto pf_skip; /* request slot taken */
+				}
+				for (int k = 0; k < 2; k++) {
+					int t = want[k];
+					if (t < 0 || t >= g_disp_count)
+						continue;
+					if (pf_d[0] == t || pf_d[1] == t)
+						continue;
+					struct disp_item *ti = &g_disp[t];
+					if (ti->src == SRC_LOCAL &&
+					    g_local_is_video[ti->idx])
+						continue; /* no poster re-extract */
+					g_req_idx = ti->idx;
+					g_req_src = ti->src;
+					g_req_detail = 1;
+					g_req_is_video = 0;
+					if (ti->src == SRC_LOCAL)
+						snprintf(g_req_path,
+							 sizeof(g_req_path), "%s",
+							 g_local_path[ti->idx]);
+					else
+						snprintf(g_req_id,
+							 sizeof(g_req_id), "%s",
+							 g_asset_ids[ti->idx]);
+					__sync_synchronize();
+					g_req_state = REQ_PENDING;
+					pf_pending = t;
+					break;
+				}
 			}
+pf_skip:
 
 			vita2d_start_drawing();
 			vita2d_clear_screen();
 
-			if (detail_tex) {
-				draw_texture_zoom(detail_tex, zoom, &panx, &pany);
+			int sliding = (slide_anim ||
+				       slide_x > 0.5f || slide_x < -0.5f);
+			if (sliding) {
+				/* current photo offset by the slide, neighbor
+				 * riding alongside (its grid thumb blown up;
+				 * the full image loads once it lands) */
+				if (detail_tex)
+					draw_texture_fitted(detail_tex, slide_x,
+							    0, SCREEN_W, SCREEN_H);
+				else {
+					vita2d_texture *th = disp_thumb(sel);
+					if (th)
+						draw_texture_fitted(th, slide_x, 0,
+								    SCREEN_W,
+								    SCREEN_H);
+				}
+				int going_next = (slide_x < 0 || slide_goal < 0);
+				int nb = going_next ? sel + 1 : sel - 1;
+				float nx = slide_x +
+					   (going_next ? SCREEN_W : -SCREEN_W);
+				if (nb >= 0 && nb < g_disp_count) {
+					/* prefer the prefetched full-res */
+					vita2d_texture *th = NULL;
+					if (pf_d[0] == nb)
+						th = pf_tex[0];
+					else if (pf_d[1] == nb)
+						th = pf_tex[1];
+					if (!th)
+						th = disp_thumb(nb);
+					if (th)
+						draw_texture_fitted(th, nx, 0,
+								    SCREEN_W,
+								    SCREEN_H);
+				}
 			} else if (is_video) {
-				draw_centered(SCREEN_H / 2,
-					      RGBA8(200, 200, 200, 255),
-					      "Press X to play this video");
+				/* video: its poster with a play button (the
+				 * poster is the detail load for server videos,
+				 * the grid thumb for local ones) */
+				vita2d_texture *poster = detail_tex ?
+					detail_tex : disp_thumb(sel);
+				if (poster)
+					draw_texture_fitted(poster, 0, 0,
+							    SCREEN_W, SCREEN_H);
+				draw_play_overlay();
+			} else if (detail_tex) {
+				draw_texture_zoom(detail_tex, zoom, &panx, &pany);
 			} else if (detail_loading) {
 				/* low-res grid thumb blown up while the full
 				 * image is still on its way */
@@ -3366,8 +3823,8 @@ int main(void)
 					      "Failed to load this photo");
 			}
 
-			const char *xhint = detail_failed ? "X retry    " :
-					    is_video ? "X play    " : "";
+			const char *xhint = is_video ? "X play    " :
+					    detail_failed ? "X retry    " : "";
 			char hud[200];
 			if (zoom > 1.001f)
 				snprintf(hud, sizeof(hud),
@@ -3538,6 +3995,9 @@ int main(void)
 	for (int i = 0; i < g_texpool_n; i++) /* drain the recycle pool */
 		vita2d_free_texture(g_texpool[i]);
 	g_texpool_n = 0;
+	for (int k = 0; k < 2; k++)
+		if (pf_tex[k])
+			vita2d_free_texture(pf_tex[k]);
 	if (detail_tex)
 		vita2d_free_texture(detail_tex);
 	for (int i = 0; i < g_asset_count; i++)
