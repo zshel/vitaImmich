@@ -26,6 +26,7 @@
 #include <psp2/avplayer.h>
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
+#include <psp2/touch.h>
 #include <psp2/gxm.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/io/fcntl.h>
@@ -1403,6 +1404,33 @@ static int month_jump(int d, int dir)
 	return i;
 }
 
+/* display slot whose grid cell contains the (screen-x, world-y) point,
+ * or -1: touch hit-testing for tap-to-open */
+static int item_at(float x, float wy)
+{
+	for (int i = 0; i < g_disp_count; i++) {
+		if (g_item_y[i] > wy)
+			break; /* item y is non-decreasing */
+		if (wy < g_item_y[i] + CELL_H &&
+		    x >= g_item_x[i] && x < g_item_x[i] + CELL_W)
+			return i;
+	}
+	return -1;
+}
+
+/* display slot nearest a world-y (used to keep the selection inside the
+ * viewport while a touch drag/fling moves the grid) */
+static int item_near(float wy)
+{
+	int last = -1;
+	for (int i = 0; i < g_disp_count; i++) {
+		if (g_item_y[i] + CELL_H > wy)
+			return i;
+		last = i;
+	}
+	return last;
+}
+
 /* find the display slot for a given source item (after a rebuild reorders
  * things, to keep the selection on the same photo) */
 static int find_disp(unsigned char src, int idx)
@@ -2731,6 +2759,9 @@ int main(void)
 
 	/* analog mode so the left stick reports lx/ly for detail-view panning */
 	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
+	/* front touch: drag scrolls the grid, a tap opens the item */
+	sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,
+				 SCE_TOUCH_SAMPLING_STATE_START);
 
 	/* start a fresh debug log each launch */
 	sceIoMkdir(CONFIG_DIR, 0777);
@@ -2832,6 +2863,13 @@ int main(void)
 	int detail_loading = 0;  /* full-res load in flight on the worker */
 	int detail_issued = 0;   /* the worker request has been handed over */
 	float zoom = 1.0f, panx = 0.0f, pany = 0.0f;
+
+	/* front-touch state (grid: drag scrolls, tap opens) */
+	int touch_active = 0;   /* finger currently down */
+	int touch_dragged = 0;  /* moved past the tap threshold */
+	float touch_x = 0, touch_y = 0;       /* last position, screen px */
+	float touch_start_y = 0, touch_start_scroll = 0;
+	float touch_vel = 0;    /* px/frame at the moment of release */
 
 	for (;;) {
 		SceCtrlData pad;
@@ -2948,6 +2986,89 @@ int main(void)
 					rebuild_display();
 				if (sel >= g_disp_count)
 					sel = g_disp_count - 1;
+			}
+
+			/* front touch: drag scrolls the timeline directly, a
+			 * fling keeps it gliding, a tap opens the item under
+			 * the finger. the front panel reports 2x screen px. */
+			{
+				SceTouchData td;
+				sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
+				float maxs = g_content_h - SCREEN_H;
+				if (maxs < 0)
+					maxs = 0;
+				if (td.reportNum > 0) {
+					float tx = td.report[0].x * 0.5f;
+					float ty = td.report[0].y * 0.5f;
+					if (!touch_active) {
+						touch_active = 1;
+						touch_dragged = 0;
+						touch_start_y = ty;
+						touch_start_scroll = scroll;
+						touch_vel = 0;
+					} else {
+						float dy = ty - touch_start_y;
+						if (!touch_dragged &&
+						    (dy > 14.0f || dy < -14.0f))
+							touch_dragged = 1;
+						if (touch_dragged) {
+							float ns = touch_start_scroll - dy;
+							if (ns < 0)
+								ns = 0;
+							if (ns > maxs)
+								ns = maxs;
+							touch_vel = ns - scroll;
+							scroll = target = ns;
+							/* keep the selection inside
+							 * the dragged viewport */
+							int c = item_near(ns + SCREEN_H / 2);
+							if (c >= 0)
+								sel = c;
+						}
+					}
+					touch_x = tx;
+					touch_y = ty;
+				} else if (touch_active) {
+					touch_active = 0;
+					if (!touch_dragged) {
+						/* tap: open the item under it */
+						int i = item_at(touch_x,
+								touch_y + scroll);
+						if (i >= 0) {
+							sel = i;
+							if (disp_is_video(i)) {
+								struct disp_item ti = g_disp[i];
+								if (ti.src == SRC_LOCAL)
+									play_video_file(g_local_path[ti.idx]);
+								else
+									view_video(ti.idx);
+								do {
+									sceCtrlPeekBufferPositive(0, &pad, 1);
+									sceKernelDelayThread(10 * 1000);
+								} while (pad.buttons);
+								prev_buttons = 0;
+								continue;
+							}
+							mode = MODE_DETAIL;
+							zoom = 1.0f;
+							panx = pany = 0.0f;
+						}
+					} else if (touch_vel > 2.0f ||
+						   touch_vel < -2.0f) {
+						/* fling: glide on; aim the
+						 * selection at the destination
+						 * so scroll-follow doesn't
+						 * fight the glide */
+						target = scroll + touch_vel * 18.0f;
+						if (target < 0)
+							target = 0;
+						if (target > maxs)
+							target = maxs;
+						int c = item_near(target + SCREEN_H / 2);
+						if (c >= 0)
+							sel = c;
+					}
+				}
 			}
 
 			/* scroll follows the selection, using the precomputed
