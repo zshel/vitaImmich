@@ -1443,6 +1443,40 @@ static void rebuild_display(void)
 	layout_grid();
 }
 
+/* first item of the month-run after (dir>0, older) or before (dir<0, newer)
+ * the one containing display slot d; the timeline is "YYYY-MM"-grouped and
+ * date-descending, so a month is a contiguous run of equal 7-char prefixes */
+static int month_jump(int d, int dir)
+{
+	if (g_disp_count == 0)
+		return 0;
+	if (d < 0)
+		d = 0;
+	if (d >= g_disp_count)
+		d = g_disp_count - 1;
+	const char *cur = disp_date(d);
+	int i = d;
+	if (dir > 0) {
+		while (i < g_disp_count - 1) {
+			i++;
+			if (strncmp(disp_date(i), cur, 7))
+				return i; /* first item of the next month */
+		}
+		return g_disp_count - 1; /* already in the last month */
+	}
+	/* back to the start of the current month-run */
+	while (i > 0 && !strncmp(disp_date(i - 1), cur, 7))
+		i--;
+	if (i == 0)
+		return 0;
+	/* then to the start of the previous (newer) month-run */
+	const char *prev = disp_date(i - 1);
+	i--;
+	while (i > 0 && !strncmp(disp_date(i - 1), prev, 7))
+		i--;
+	return i;
+}
+
 /* find the display slot for a given source item (after a rebuild reorders
  * things, to keep the selection on the same photo) */
 static int find_disp(unsigned char src, int idx)
@@ -2960,14 +2994,14 @@ int main(void)
 				sel += COLS;
 			if (nav & SCE_CTRL_UP)
 				sel -= COLS;
-			if (pressed & SCE_CTRL_RTRIGGER)
-				sel += COLS * 2; /* page down */
-			if (pressed & SCE_CTRL_LTRIGGER)
-				sel -= COLS * 2;
 			if (sel < 0)
 				sel = 0;
 			if (sel >= g_disp_count)
 				sel = g_disp_count - 1;
+			if (pressed & SCE_CTRL_RTRIGGER)
+				sel = month_jump(sel, +1); /* older month */
+			if (pressed & SCE_CTRL_LTRIGGER)
+				sel = month_jump(sel, -1); /* newer month */
 
 			/* Track how long the selection has held still. A held
 			 * d-pad auto-repeats one row every few frames; while it's
@@ -2989,6 +3023,24 @@ int main(void)
 			int scrolling_fast = (grid_settle < 12);
 
 			if (pressed & SCE_CTRL_CROSS) {
+				if (g_disp_count > 0 && disp_is_video(sel)) {
+					/* videos start loading/playing right
+					 * away; no "press X to play" stop */
+					struct disp_item it = g_disp[sel];
+					if (it.src == SRC_LOCAL)
+						play_video_file(g_local_path[it.idx]);
+					else
+						view_video(it.idx);
+					/* wait for the player's buttons to be
+					 * released so they don't also act on
+					 * the grid */
+					do {
+						sceCtrlPeekBufferPositive(0, &pad, 1);
+						sceKernelDelayThread(10 * 1000);
+					} while (pad.buttons);
+					prev_buttons = 0;
+					continue;
+				}
 				mode = MODE_DETAIL;
 				zoom = 1.0f;
 				panx = pany = 0.0f;
