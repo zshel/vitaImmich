@@ -1622,6 +1622,12 @@ static void play_video_file(const char *path)
 	for (int i = 0; i < 720 && g_poster_active; i++)
 		show_status("Starting video...");
 
+	/* replay re-inits the player from the same (already-local) file, so the
+	 * decoder claim above is taken once and held across replays. */
+	int want_replay;
+replay:
+	want_replay = 0;
+
 	SceAvPlayerInitData init;
 	memset(&init, 0, sizeof(init));
 	init.memoryReplacement.allocate          = av_alloc;
@@ -1673,13 +1679,10 @@ static void play_video_file(const char *path)
 	for (int i = 0; i < 300 && !(active = sceAvPlayerIsActive(g_avp)); i++)
 		show_status("Starting video...");
 
+	/* AddSource parses asynchronously, so the stream duration is usually not
+	 * available yet at this point; keep re-querying it in the loop below until
+	 * it becomes known instead of latching the initial 0. */
 	uint64_t duration = 0;
-	if (active) {
-		SceAvPlayerStreamInfo sinfo;
-		memset(&sinfo, 0, sizeof(sinfo));
-		if (sceAvPlayerGetStreamInfo(g_avp, 0, &sinfo) >= 0)
-			duration = sinfo.duration;
-	}
 
 	/* four rotating frame wrappers (matching numOutputVideoFrameBuffers):
 	 * while the GPU still samples one frame the decoder fills another, and
@@ -1694,6 +1697,7 @@ static void play_video_file(const char *path)
 	vita2d_texture *cur = NULL;
 
 	int paused = 0;
+	int ended_eos = 0;
 	unsigned int prev = 0xffffffff; /* swallow the X press that got us here */
 
 	while (active) {
@@ -1721,8 +1725,10 @@ static void play_video_file(const char *path)
 				sceAvPlayerJumpToTime(g_avp, t);
 		}
 
-		if (!sceAvPlayerIsActive(g_avp))
+		if (!sceAvPlayerIsActive(g_avp)) {
+			ended_eos = 1;
 			break; /* end of stream */
+		}
 
 		if (sceAvPlayerGetVideoData(g_avp, &vframe[buf_idx])) {
 			sceGxmTextureInitLinear(&vtex[buf_idx].gxm_tex,
@@ -1739,6 +1745,13 @@ static void play_video_file(const char *path)
 		vita2d_clear_screen();
 		if (cur)
 			draw_texture_fitted(cur, 0, 0, SCREEN_W, SCREEN_H);
+
+		if (duration == 0) {
+			SceAvPlayerStreamInfo sinfo;
+			memset(&sinfo, 0, sizeof(sinfo));
+			if (sceAvPlayerGetStreamInfo(g_avp, 0, &sinfo) >= 0)
+				duration = sinfo.duration;
+		}
 
 		unsigned int cs = (unsigned int)(sceAvPlayerCurrentTime(g_avp) / 1000);
 		unsigned int ds = (unsigned int)(duration / 1000);
@@ -1761,6 +1774,36 @@ static void play_video_file(const char *path)
 				    "check Immich transcoding settings.");
 	}
 
+	/* reached the end of the video: hold on the last frame with a replay
+	 * prompt instead of returning (which, for a server video, drops the user
+	 * back to the detail screen and would re-download to play it again). X
+	 * replays from the still-local file; O leaves. The decoder buffers behind
+	 * `cur` are still valid here — teardown happens below, after this loop. */
+	if (ended_eos) {
+		unsigned int eprev = 0xffffffff;
+		for (;;) {
+			SceCtrlData pad;
+			sceCtrlPeekBufferPositive(0, &pad, 1);
+			unsigned int pressed = pad.buttons & ~eprev;
+			eprev = pad.buttons;
+
+			if (pressed & SCE_CTRL_CIRCLE)
+				break;
+			if (pressed & SCE_CTRL_CROSS) {
+				want_replay = 1;
+				break;
+			}
+
+			vita2d_start_drawing();
+			vita2d_clear_screen();
+			if (cur)
+				draw_texture_fitted(cur, 0, 0, SCREEN_W, SCREEN_H);
+			draw_hud("ended    X replay    O back");
+			vita2d_end_drawing();
+			vita2d_swap_buffers();
+		}
+	}
+
 	g_av_audio_run = 0;
 	if (audio_thid >= 0) {
 		sceKernelWaitThreadEnd(audio_thid, NULL, NULL);
@@ -1770,6 +1813,9 @@ static void play_video_file(const char *path)
 	vita2d_wait_rendering_done();
 	sceAvPlayerStop(g_avp);
 	sceAvPlayerClose(g_avp);
+
+	if (want_replay)
+		goto replay; /* re-init from the same file; no re-download */
 
 	/* release the decoder so the worker can resume poster extraction */
 	g_player_active = 0;
