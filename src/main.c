@@ -2995,11 +2995,11 @@ int main(void)
 			}
 
 			/* fetch the next page when the selection settles near the
-			 * end (gated on !scrolling_fast, see above) */
+			 * end (gated on !scrolling_fast, see above). no loading
+			 * screen: the grid stays up, the HUD's "+" already says
+			 * more is coming, and the fetch only blocks briefly */
 			if (!scrolling_fast && g_next_page > 0 &&
 			    sel >= g_disp_count - COLS * 4) {
-				show_status("Loading more photos... (%d so far)",
-					    g_asset_count);
 				if (fetch_page(0) > 0)
 					rebuild_display();
 				if (sel >= g_disp_count)
