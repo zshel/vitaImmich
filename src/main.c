@@ -1117,6 +1117,11 @@ static vita2d_texture *req_build_texture(char *err, size_t errlen, int pooled)
 		free(g_req_raw);
 		g_req_raw = NULL;
 	}
+	/* bilinear, not nearest: thumbs get blown up in the detail view and
+	 * full-res photos get scaled down to the screen */
+	if (tex)
+		vita2d_texture_set_filters(tex, SCE_GXM_TEXTURE_FILTER_LINEAR,
+					   SCE_GXM_TEXTURE_FILTER_LINEAR);
 	return tex;
 }
 
