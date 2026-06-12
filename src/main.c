@@ -83,7 +83,18 @@ static char g_syncdirs[8][192];
 static int g_syncdir_count;
 static long g_syncmax_mb = 512;
 
-static vita2d_pgf *g_font;
+/* vitasdk's freetype is built with bzip2 support but the SDK ships no
+ * libbz2; we never load bzip2-compressed fonts, so failing stubs satisfy
+ * the linker */
+int BZ2_bzDecompressInit(void *strm, int verbosity, int small);
+int BZ2_bzDecompress(void *strm);
+int BZ2_bzDecompressEnd(void *strm);
+int BZ2_bzDecompressInit(void *strm, int verbosity, int small) { return -1; }
+int BZ2_bzDecompress(void *strm) { return -1; }
+int BZ2_bzDecompressEnd(void *strm) { return -1; }
+
+static vita2d_pgf *g_font;           /* system font, fallback */
+static vita2d_font *g_ttf;           /* bundled Overpass (Immich's face) */
 
 /* server-asset arrays. dynamically grown (doubling) as pages are fetched, so
  * the library is bounded only by memory, not a fixed cap. grown on the main
@@ -296,10 +307,59 @@ static void log_line(const char *fmt, ...)
 /* drawing helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+/* one Overpass instance per pixel size: vita2d's glyph atlas caches every
+ * glyph at the first size it is drawn at and reuses that bitmap for other
+ * sizes, so mixing sizes in one font renders letters at the wrong size (an
+ * "E" cached at 20 px showing up oversized inside 17 px text). */
+static vita2d_font *ttf_for(unsigned int px)
+{
+	static vita2d_font *cache[8];
+	static unsigned int cache_px[8];
+	static int n;
+
+	for (int i = 0; i < n; i++)
+		if (cache_px[i] == px)
+			return cache[i];
+	if (n < 8) {
+		vita2d_font *f = vita2d_load_font_file("app0:font.ttf");
+		if (f) {
+			cache[n] = f;
+			cache_px[n] = px;
+			n++;
+			return f;
+		}
+	}
+	return g_ttf; /* shared instance, better than nothing */
+}
+
+/* text via the bundled Overpass TTF (Immich's typeface), falling back to
+ * the system PGF font if the TTF failed to load. the pgf "scale" the call
+ * sites use maps to a pixel size (1.0 ~ 20 px). */
+static void draw_text(float x, float y, uint32_t color, float scale,
+		      const char *text)
+{
+	if (g_ttf) {
+		unsigned int px = (unsigned int)(scale * 20.0f + 0.5f);
+		vita2d_font_draw_text(ttf_for(px), (int)x, (int)y, color,
+				      px, text);
+	} else {
+		vita2d_pgf_draw_text(g_font, x, y, color, scale, text);
+	}
+}
+
+static int text_width(float scale, const char *text)
+{
+	if (g_ttf) {
+		unsigned int px = (unsigned int)(scale * 20.0f + 0.5f);
+		return vita2d_font_text_width(ttf_for(px), px, text);
+	}
+	return vita2d_pgf_text_width(g_font, scale, text);
+}
+
 static void draw_centered(int y, uint32_t color, const char *text)
 {
-	int w = vita2d_pgf_text_width(g_font, 1.0f, text);
-	vita2d_pgf_draw_text(g_font, (SCREEN_W - w) / 2, y, color, 1.0f, text);
+	int w = text_width(1.0f, text);
+	draw_text((SCREEN_W - w) / 2, y, color, 1.0f, text);
 }
 
 static void show_status(const char *fmt, ...)
@@ -344,7 +404,7 @@ static void fatal_error(const char *detail, const char *fmt, ...)
 			for (int off = 0; off < len && y < 480; off += chars_per_line, y += 26) {
 				char line[96];
 				snprintf(line, sizeof(line), "%.*s", chars_per_line, detail + off);
-				vita2d_pgf_draw_text(g_font, 40, y, RGBA8(200, 200, 200, 255), 1.0f, line);
+				draw_text(40, y, RGBA8(200, 200, 200, 255), 1.0f, line);
 			}
 		}
 		draw_centered(510, RGBA8(160, 160, 160, 255), "Press START to exit");
@@ -1755,7 +1815,7 @@ static void draw_sel_outline(float x, float y, float w, float h)
 static void draw_hud(const char *text)
 {
 	vita2d_draw_rectangle(0, SCREEN_H - 32, SCREEN_W, 32, RGBA8(0, 0, 0, 180));
-	vita2d_pgf_draw_text(g_font, 10, SCREEN_H - 9,
+	draw_text(10, SCREEN_H - 9,
 			     RGBA8(255, 255, 255, 255), 1.0f, text);
 }
 
@@ -1793,7 +1853,7 @@ static void draw_play_overlay(void)
 static void draw_error_detail(int idx)
 {
 	draw_centered(220, RGBA8(255, 80, 80, 255), "Failed to load this photo");
-	vita2d_pgf_draw_text(g_font, 40, 270, RGBA8(200, 200, 200, 255),
+	draw_text(40, 270, RGBA8(200, 200, 200, 255),
 			     1.0f, g_asset_ids[idx]);
 	const char *e = g_tex_err[idx];
 	int len = strlen(e), y = 300;
@@ -1801,7 +1861,7 @@ static void draw_error_detail(int idx)
 	for (int off = 0; off < len && y < 500; off += per_line, y += 26) {
 		char line[80];
 		snprintf(line, sizeof(line), "%.*s", per_line, e + off);
-		vita2d_pgf_draw_text(g_font, 40, y, RGBA8(200, 200, 200, 255), 1.0f, line);
+		draw_text(40, y, RGBA8(200, 200, 200, 255), 1.0f, line);
 	}
 }
 
@@ -3096,6 +3156,7 @@ int main(void)
 	vita2d_init();
 	vita2d_set_clear_color(RGBA8(16, 16, 16, 255));
 	g_font = vita2d_load_default_pgf();
+	g_ttf = vita2d_load_font_file("app0:font.ttf");
 
 	/* analog mode so the left stick reports lx/ly for detail-view panning */
 	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
@@ -3537,7 +3598,7 @@ int main(void)
 				float hy = g_sect[h].y - scroll;
 				if (hy + HEADER_H < 0 || hy > SCREEN_H)
 					continue;
-				vita2d_pgf_draw_text(g_font, 10, hy + HEADER_H - 12,
+				draw_text(10, hy + HEADER_H - 12,
 						     RGBA8(255, 255, 255, 255),
 						     1.1f, g_sect[h].label);
 				vita2d_draw_rectangle(10, hy + HEADER_H - 6,
@@ -3565,7 +3626,7 @@ int main(void)
 					vita2d_draw_rectangle(bx, by + bh - 26,
 							      64, 26,
 							      RGBA8(0, 0, 0, 170));
-					vita2d_pgf_draw_text(g_font, bx + 6,
+					draw_text(bx + 6,
 							     by + bh - 7,
 							     RGBA8(255, 255, 255, 255),
 							     0.85f, "VIDEO");
@@ -4073,25 +4134,25 @@ pf_skip:
 				 "Server assets: %d%s  (%d photos, %d videos)",
 				 g_asset_count, g_next_page > 0 ? "+" : "",
 				 g_asset_count - srv_vid, srv_vid);
-			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 30;
+			draw_text(60, y, c, 1.0f, line); y += 30;
 			human_size(loc_bytes, sz1, sizeof(sz1));
 			snprintf(line, sizeof(line),
 				 "Local files:   %d  (%d photos, %d videos)  %s",
 				 g_local_count, g_local_count - loc_vid, loc_vid, sz1);
-			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 30;
+			draw_text(60, y, c, 1.0f, line); y += 30;
 			snprintf(line, sizeof(line),
 				 "backed up %d   local-only %d   queued/uploading %d",
 				 backed, local_only, queued);
-			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 30;
+			draw_text(60, y, c, 1.0f, line); y += 30;
 			snprintf(line, sizeof(line), "scanning/hashing %d   failed %d",
 				 pending, failed);
-			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 30;
+			draw_text(60, y, c, 1.0f, line); y += 30;
 			human_size(backed_bytes, sz1, sizeof(sz1));
 			human_size(loc_bytes, sz2, sizeof(sz2));
 			snprintf(line, sizeof(line),
 				 "Backed up: %d%% of local  (%s / %s)",
 				 loc_pct, sz1, sz2);
-			vita2d_pgf_draw_text(g_font, 60, y,
+			draw_text(60, y,
 					     RGBA8(120, 200, 120, 255), 1.0f, line);
 			y += 38;
 
@@ -4107,7 +4168,7 @@ pf_skip:
 					name = g_asset_ids[si->idx];
 				}
 				snprintf(line, sizeof(line), "Selected: %.40s", name);
-				vita2d_pgf_draw_text(g_font, 60, y, c, 0.95f, line);
+				draw_text(60, y, c, 0.95f, line);
 				y += 26;
 				if (si->src == SRC_LOCAL) {
 					human_size(g_local_size[si->idx], sz1,
@@ -4125,7 +4186,7 @@ pf_skip:
 						 g_asset_is_video[si->idx] ?
 							 "video" : "photo");
 				}
-				vita2d_pgf_draw_text(g_font, 60, y, c, 0.95f, line);
+				draw_text(60, y, c, 0.95f, line);
 			}
 			y += 36;
 
@@ -4139,21 +4200,21 @@ pf_skip:
 					snprintf(line, sizeof(line), "%s",
 						 g_sync_activity);
 				}
-				vita2d_pgf_draw_text(g_font, 60, y,
+				draw_text(60, y,
 						     RGBA8(120, 200, 120, 255),
 						     1.0f, line);
 			}
 			y += 44;
 
 			if (g_sync_errn > 0) {
-				vita2d_pgf_draw_text(g_font, 60, y,
+				draw_text(60, y,
 						     RGBA8(220, 120, 120, 255),
 						     1.0f, "Recent errors:");
 				y += 30;
 				int shown = g_sync_errn < 5 ? g_sync_errn : 5;
 				for (int k = 0; k < shown && y < 480; k++) {
 					int e = (g_sync_errn - shown + k) % 5;
-					vita2d_pgf_draw_text(g_font, 60, y,
+					draw_text(60, y,
 							     RGBA8(200, 160, 160, 255),
 							     0.9f, g_sync_errlog[e]);
 					y += 26;
@@ -4191,6 +4252,8 @@ pf_skip:
 	for (int i = 0; i < g_local_count; i++)
 		if (g_local_thumb[i])
 			vita2d_free_texture(g_local_thumb[i]);
+	if (g_ttf)
+		vita2d_free_font(g_ttf);
 	vita2d_free_pgf(g_font);
 	vita2d_fini();
 	curl_global_cleanup();

@@ -53,4 +53,6 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
   FILE ${CMAKE_SOURCE_DIR}/assets/sce_sys/icon0.png sce_sys/icon0.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/Overpass-SemiBold.ttf font.ttf
+  FILE ${CMAKE_SOURCE_DIR}/assets/OFL-Overpass.txt OFL-Overpass.txt
 )
