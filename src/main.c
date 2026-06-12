@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <math.h>
 #include <setjmp.h>
 #include <malloc.h>
 
@@ -91,6 +92,7 @@ static vita2d_pgf *g_font;
 static char (*g_asset_ids)[40];
 static char (*g_asset_dates)[DATELEN]; /* YYYY-MM-DDTHH:MM:SS */
 static float *g_asset_ratio;           /* display w/h from exif, 0 = unknown */
+static unsigned char *g_asset_rot;     /* raw exif orientation (0 = none) */
 static unsigned char *g_asset_is_video;
 /* set during display rebuild: a backed-up local file matches this server
  * asset, so its grid cell shows the green "backed up" badge */
@@ -219,6 +221,7 @@ static int grow_assets(int need)
 	if (!GROW(g_asset_ids, c, need) ||
 	    !GROW(g_asset_dates, c, need) ||
 	    !GROW(g_asset_ratio, c, need) ||
+	    !GROW(g_asset_rot, c, need) ||
 	    !GROW(g_asset_is_video, c, need) ||
 	    !GROW(g_asset_local_backed, c, need) ||
 	    !GROW(g_thumb, c, need) ||
@@ -804,6 +807,8 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 			if (cur >= 0 && exw > 0 && exh > 0)
 				g_asset_ratio[cur] = (exori >= 5 && exori <= 8) ?
 					(float)exh / exw : (float)exw / exh;
+			if (cur >= 0)
+				g_asset_rot[cur] = (unsigned char)exori;
 			if (!grow_assets(g_asset_count + 1))
 				break; /* out of memory: keep what we have */
 			cur = g_asset_count++;
@@ -814,6 +819,7 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 			g_asset_ids[cur][0] = '\0';
 			g_asset_dates[cur][0] = '\0';
 			g_asset_ratio[cur] = 0.0f;
+			g_asset_rot[cur] = 0;
 			g_asset_is_video[cur] = 0;
 			continue;
 		}
@@ -865,6 +871,8 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 	if (cur >= 0 && exw > 0 && exh > 0)
 		g_asset_ratio[cur] = (exori >= 5 && exori <= 8) ?
 			(float)exh / exw : (float)exw / exh;
+	if (cur >= 0)
+		g_asset_rot[cur] = (unsigned char)exori;
 	free(tok);
 
 	/* drop trailing entries that somehow lack an id */
@@ -876,6 +884,37 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 }
 
 /* fetch the next page of the library, newest first; returns assets added */
+/* compact away just-parsed entries [before, g_asset_count) whose id already
+ * exists below `before` (the server's pages shift when assets are added or
+ * removed, so refetches can overlap). order among the new tail doesn't
+ * matter — the display rebuild sorts by date — and none of these have
+ * textures yet. returns how many genuinely new entries remain. */
+static int dedup_new_assets(int before)
+{
+	int n = g_asset_count;
+	for (int i = before; i < n; ) {
+		int dup = 0;
+		for (int j = 0; j < before && !dup; j++)
+			dup = !strcmp(g_asset_ids[j], g_asset_ids[i]);
+		if (!dup) {
+			i++;
+			continue;
+		}
+		n--;
+		if (i != n) {
+			memcpy(g_asset_ids[i], g_asset_ids[n],
+			       sizeof(g_asset_ids[0]));
+			memcpy(g_asset_dates[i], g_asset_dates[n],
+			       sizeof(g_asset_dates[0]));
+			g_asset_ratio[i] = g_asset_ratio[n];
+			g_asset_rot[i] = g_asset_rot[n];
+			g_asset_is_video[i] = g_asset_is_video[n];
+		}
+	}
+	g_asset_count = n;
+	return n - before;
+}
+
 static int fetch_page(int is_first)
 {
 	if (g_next_page <= 0)
@@ -914,6 +953,7 @@ static int fetch_page(int is_first)
 	}
 
 	char err[160];
+	int before = g_asset_count;
 	int added = parse_assets(buf.data, buf.size, err, sizeof(err));
 	if (added < 0) {
 		if (is_first)
@@ -925,14 +965,50 @@ static int fetch_page(int is_first)
 	}
 	free(buf.data);
 
-	/* a short page means we reached the end of the library */
+	/* a short (raw) page means we reached the end of the library; the
+	 * dedup below only filters overlap from server-side page drift */
 	g_next_page = (added == PAGE_SIZE) ? g_next_page + 1 : 0;
+	int fresh = dedup_new_assets(before);
 	int with_ratio = 0;
-	for (int i = g_asset_count - added; i < g_asset_count; i++)
+	for (int i = g_asset_count - fresh; i < g_asset_count; i++)
 		with_ratio += (g_asset_ratio[i] > 0.0f);
 	log_line("page fetched: +%d assets (total %d, %d with exif ratio)",
-		 added, g_asset_count, with_ratio);
-	return added;
+		 fresh, g_asset_count, with_ratio);
+	return fresh;
+}
+
+/* poll the newest page for photos added to the server since we fetched;
+ * duplicates of already-known assets are dropped, so only genuinely new
+ * items remain appended. main-thread only (mutates the asset arrays).
+ * returns the number of new assets. */
+static int check_new_assets(void)
+{
+	char url[600];
+	snprintf(url, sizeof(url), "%s/api/search/metadata", g_server);
+	char body[160];
+	snprintf(body, sizeof(body),
+		 "{\"page\":1,\"size\":%d,\"order\":\"desc\",\"withExif\":true}",
+		 PAGE_SIZE);
+
+	membuf buf;
+	long code;
+	CURLcode res = http_request(url, body, &buf, &code, NULL, 0);
+	if (res != CURLE_OK || code < 200 || code >= 300) {
+		free(buf.data);
+		return 0;
+	}
+
+	char err[160];
+	int before = g_asset_count;
+	int added = parse_assets(buf.data, buf.size, err, sizeof(err));
+	free(buf.data);
+	if (added <= 0)
+		return 0;
+
+	int fresh = dedup_new_assets(before);
+	if (fresh > 0)
+		log_line("poll: %d new asset(s) on the server", fresh);
+	return fresh;
 }
 
 
@@ -1454,6 +1530,33 @@ static void rebuild_display(void)
 	layout_grid();
 }
 
+static int find_disp(unsigned char src, int idx);
+
+/* rebuild the display after the asset set changed, keeping the view glued
+ * to the photo the selection is on: the selection follows the item, and the
+ * scroll/target keep their offset relative to it, so a page fetch or poll
+ * relayout doesn't visibly move the grid. */
+static void rebuild_keep_view(int *sel, float *scroll, float *target)
+{
+	int had = (*sel >= 0 && *sel < g_disp_count);
+	struct disp_item keep = had ? g_disp[*sel] : (struct disp_item){ 0, 0 };
+	float dt = had ? *target - g_item_y[*sel] : 0.0f;
+	float ds = had ? *scroll - g_item_y[*sel] : 0.0f;
+	rebuild_display();
+	if (had) {
+		int ns = find_disp(keep.src, keep.idx);
+		if (ns >= 0) {
+			*sel = ns;
+			*target = g_item_y[ns] + dt;
+			*scroll = g_item_y[ns] + ds;
+		}
+	}
+	if (*sel >= g_disp_count)
+		*sel = g_disp_count - 1;
+	if (*sel < 0)
+		*sel = 0;
+}
+
 /* first item of the month-run after (dir>0, older) or before (dir<0, newer)
  * the one containing display slot d; the timeline is "YYYY-MM"-grouped and
  * date-descending, so a month is a contiguous run of equal 7-char prefixes */
@@ -1656,6 +1759,21 @@ static void draw_hud(const char *text)
 			     RGBA8(255, 255, 255, 255), 1.0f, text);
 }
 
+/* spinning throbber: a ring of dots with a brightness tail */
+static void draw_throbber(float cx, float cy, float r, unsigned int frame)
+{
+	for (int i = 0; i < 12; i++) {
+		float a = (float)i * (6.2831853f / 12.0f);
+		int phase = ((int)(frame / 3) - i) % 12;
+		if (phase < 0)
+			phase += 12;
+		unsigned char al = (unsigned char)(255 - phase * 18);
+		vita2d_draw_fill_circle(cx + cosf(a) * r, cy + sinf(a) * r,
+					r / 5.5f,
+					RGBA8(255, 255, 255, al));
+	}
+}
+
 /* translucent play button over a video's poster in the detail view */
 static void draw_play_overlay(void)
 {
@@ -1727,6 +1845,39 @@ static uint64_t g_dl_last_draw;
  * (the seconds AVPlayer spends parsing before the first frame); set by the
  * play call sites, valid for the whole modal download + playback */
 static vita2d_texture *g_dl_bg;
+
+/* display rotation (degrees clockwise) of the video being played; from the
+ * asset's exif orientation, so portrait recordings play upright */
+static int g_video_rot;
+
+static int ori_to_deg(int o)
+{
+	switch (o) {
+	case 3: case 4: return 180;
+	case 5: case 6: return 90;
+	case 7: case 8: return 270;
+	default:        return 0;
+	}
+}
+
+/* fit a (possibly rotated) video frame to the screen */
+static void draw_video_frame(vita2d_texture *tex)
+{
+	float w = vita2d_texture_get_width(tex);
+	float h = vita2d_texture_get_height(tex);
+	if (g_video_rot == 0) {
+		draw_texture_fitted(tex, 0, 0, SCREEN_W, SCREEN_H);
+		return;
+	}
+	int side = (g_video_rot == 90 || g_video_rot == 270);
+	float ew = side ? h : w, eh = side ? w : h;
+	float sc = ((float)SCREEN_W / ew < (float)SCREEN_H / eh) ?
+		   (float)SCREEN_W / ew : (float)SCREEN_H / eh;
+	vita2d_draw_texture_scale_rotate(tex, SCREEN_W / 2.0f, SCREEN_H / 2.0f,
+					 sc, sc,
+					 (float)g_video_rot *
+					 (3.14159265f / 180.0f));
+}
 
 /* full-screen status with the video's poster behind it */
 static void show_video_status(const char *text)
@@ -2233,7 +2384,7 @@ replay:
 		vita2d_start_drawing();
 		vita2d_clear_screen();
 		if (cur)
-			draw_texture_fitted(cur, 0, 0, SCREEN_W, SCREEN_H);
+			draw_video_frame(cur);
 		else if (g_dl_bg)
 			/* poster until the first decoded frame arrives */
 			draw_texture_fitted(g_dl_bg, 0, 0, SCREEN_W, SCREEN_H);
@@ -2289,7 +2440,7 @@ replay:
 			vita2d_start_drawing();
 			vita2d_clear_screen();
 			if (cur)
-				draw_texture_fitted(cur, 0, 0, SCREEN_W, SCREEN_H);
+				draw_video_frame(cur);
 			draw_hud("ended    X replay    O back");
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
@@ -2322,6 +2473,7 @@ static void view_video(int idx)
 	 * asset thumb. the modal download keeps the texture alive. */
 	if (!g_dl_bg)
 		g_dl_bg = g_thumb[idx];
+	g_video_rot = ori_to_deg(g_asset_rot[idx]);
 
 	char err[160];
 	int r = download_video(idx, err, sizeof(err));
@@ -3038,6 +3190,8 @@ int main(void)
 	int mode = MODE_GRID;
 	int sync_return_mode = MODE_GRID;
 	int sel = 0;
+	/* periodic check for photos added to the server while we run */
+	uint64_t last_poll = sceKernelGetProcessTimeWide();
 	int grid_last_sel = -1;   /* sel at the previous frame */
 	int grid_settle = 0;      /* frames since sel last changed */
 	float scroll = 0.0f, target = 0.0f;
@@ -3090,17 +3244,7 @@ int main(void)
 		 * on the same photo across the reorder */
 		if (g_need_rebuild) {
 			g_need_rebuild = 0;
-			int had = (sel >= 0 && sel < g_disp_count);
-			struct disp_item keep = had ? g_disp[sel]
-						    : (struct disp_item){ 0, 0 };
-			rebuild_display();
-			if (had) {
-				int ns = find_disp(keep.src, keep.idx);
-				if (ns >= 0)
-					sel = ns;
-			}
-			if (sel >= g_disp_count)
-				sel = g_disp_count - 1;
+			rebuild_keep_view(&sel, &scroll, &target);
 			detail_idx = -1; /* re-decode: item under sel may differ */
 			/* display slots were reshuffled: the prefetch cache's
 			 * slot keys are meaningless now */
@@ -3142,10 +3286,31 @@ int main(void)
 				sel = nav_row(sel, +1);
 			if (nav & SCE_CTRL_UP)
 				sel = nav_row(sel, -1);
-			if (pressed & SCE_CTRL_RTRIGGER)
-				sel = month_jump(sel, +1); /* older month */
-			if (pressed & SCE_CTRL_LTRIGGER)
-				sel = month_jump(sel, -1); /* newer month */
+			if ((pressed & (SCE_CTRL_RTRIGGER |
+					SCE_CTRL_LTRIGGER)) &&
+			    g_disp_count > 0) {
+				int dir = (pressed & SCE_CTRL_RTRIGGER) ?
+					  +1 : -1;
+				/* jumping down: the next month may simply not
+				 * be fetched yet — pull pages until a new
+				 * month shows up (or the library ends) */
+				if (dir > 0) {
+					int guard = 0;
+					while (g_next_page > 0 && guard++ < 10 &&
+					       !strncmp(disp_date(month_jump(sel, +1)),
+							disp_date(sel), 7)) {
+						if (fetch_page(0) <= 0)
+							break;
+						rebuild_keep_view(&sel, &scroll,
+								  &target);
+					}
+				}
+				sel = month_jump(sel, dir);
+				/* put the jumped-to month at the top of the
+				 * screen, header band included */
+				if (sel >= 0 && sel < g_disp_count)
+					target = g_item_y[sel] - HEADER_H;
+			}
 
 			/* Track how long the selection has held still. A held
 			 * d-pad auto-repeats one row every few frames; while it's
@@ -3184,9 +3349,21 @@ int main(void)
 			if (!scrolling_fast && g_next_page > 0 &&
 			    sel >= g_disp_count - COLS * 4) {
 				if (fetch_page(0) > 0)
-					rebuild_display();
-				if (sel >= g_disp_count)
-					sel = g_disp_count - 1;
+					rebuild_keep_view(&sel, &scroll,
+							  &target);
+			}
+
+			/* photos added to the server show up by themselves:
+			 * poll the newest page every ~30 s while the grid is
+			 * settled, keeping the selection on the same photo
+			 * across the relayout */
+			uint64_t pnow = sceKernelGetProcessTimeWide();
+			if (!scrolling_fast && !touch_active &&
+			    pnow - last_poll > 30ULL * 1000 * 1000) {
+				last_poll = pnow;
+				if (check_new_assets() > 0)
+					rebuild_keep_view(&sel, &scroll,
+							  &target);
 			}
 
 			/* front touch: drag scrolls the timeline directly, a
@@ -3512,6 +3689,7 @@ int main(void)
 						g_dl_bg = detail_tex ?
 							detail_tex :
 							disp_thumb(sel);
+						g_video_rot = 0;
 						if (is_local)
 							play_video_file(g_local_path[it.idx]);
 						else
@@ -3565,6 +3743,7 @@ int main(void)
 					/* play even if the poster fetch failed */
 					g_dl_bg = detail_tex ?
 						detail_tex : disp_thumb(sel);
+					g_video_rot = 0;
 					if (is_local)
 						play_video_file(g_local_path[it.idx]);
 					else
@@ -3812,9 +3991,9 @@ pf_skip:
 					draw_texture_fitted(th, 0, 0,
 							    SCREEN_W, SCREEN_H);
 				else
-					draw_centered(SCREEN_H / 2,
-						      RGBA8(160, 160, 160, 255),
-						      "Loading...");
+					draw_throbber(SCREEN_W / 2.0f,
+						      SCREEN_H / 2.0f,
+						      28.0f, frame);
 			} else if (it.src == SRC_SERVER) {
 				draw_error_detail(it.idx);
 			} else {
@@ -3832,12 +4011,18 @@ pf_skip:
 					 sel + 1, g_disp_count, zoom * 100.0f);
 			else
 				snprintf(hud, sizeof(hud),
-					 "%d / %d    %.19s    %s< > browse  L/R zoom  %sO back",
+					 "%d / %d    %.19s    < > browse  L/R zoom  %sO back",
 					 sel + 1, g_disp_count,
 					 g_disp_count > 0 ? disp_date(sel) : "",
-					 detail_loading ? "loading...  " : "",
 					 xhint);
 			draw_hud(hud);
+			/* ...and a discreet corner throbber while the
+			 * full-res image is still on its way — but only when
+			 * a preview is showing; with no preview at all the
+			 * big centered throbber is already up */
+			if (detail_loading && disp_thumb(sel))
+				draw_throbber(SCREEN_W - 36.0f, 36.0f,
+					      14.0f, frame);
 
 			vita2d_end_drawing();
 			vita2d_swap_buffers();

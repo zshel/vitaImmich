@@ -53,3 +53,18 @@ Task list for the current round of work. Checked items are done.
 - [x] Verified: repeated 10–12 s held-scroll cycles to photo 1780+ across
       multiple pages, zero GPU faults / zero crashes (previous builds died
       within ~10 s).
+
+## 6. Open bugs / polish
+- [x] R (month jump) lands on the next month, but when more pages load the
+      view shifts away from the landing spot — fixed: rebuild_keep_view pins
+      the scroll/selection to the same photo across every rebuild (page
+      fetch, poll, sync), and R now fetches ahead until the next month is
+      actually loaded before jumping.
+- [x] R scrolls the jumped-to month to the top of the screen, header band
+      included.
+- [x] Portrait videos play sideways — fixed: the asset's exif orientation
+      is kept (g_asset_rot) and the player rotates decoded frames upright
+      (draw_video_frame).
+- [x] Replaced the "loading..." texts with a spinning throbber: centered
+      when there is no preview at all, a small corner one while the full-res
+      loads over the thumb.
