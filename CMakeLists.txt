@@ -41,6 +41,8 @@ target_link_libraries(${PROJECT_NAME}
   SceAppMgr_stub
   SceNet_stub
   SceNetCtl_stub
+  SceAvPlayer_stub
+  SceAudio_stub
 )
 
 vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})

@@ -2,8 +2,9 @@
  * vitaImmich — minimal proof-of-concept Immich client for the PS Vita.
  *
  * Reads server URL + API key from ux0:data/vitaimmich/config.txt and shows
- * the photo library as a scrollable chronological grid (newest first).
- * X opens a photo full screen, O goes back.
+ * the library as a scrollable chronological grid (newest first).
+ * X opens a photo full screen, O goes back. Videos are downloaded to the
+ * memory card and played with SceAvPlayer (hardware MP4/H.264 decoding).
  */
 
 #include <stdio.h>
@@ -11,8 +12,13 @@
 #include <string.h>
 #include <stdarg.h>
 #include <setjmp.h>
+#include <malloc.h>
 
+#include <psp2/audioout.h>
+#include <psp2/avplayer.h>
 #include <psp2/ctrl.h>
+#include <psp2/gxm.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
@@ -45,6 +51,7 @@
 #define CONFIG_DIR  "ux0:data/vitaimmich"
 #define CONFIG_PATH CONFIG_DIR "/config.txt"
 #define LOG_PATH    CONFIG_DIR "/log.txt"
+#define VIDEO_TMP_PATH CONFIG_DIR "/video.mp4"
 
 /* give curl/jpeg decoding plenty of heap */
 int _newlib_heap_size_user = 192 * 1024 * 1024;
@@ -59,6 +66,7 @@ static vita2d_pgf *g_font;
 
 static char g_asset_ids[MAX_ASSETS][40];
 static char g_asset_dates[MAX_ASSETS][11]; /* YYYY-MM-DD */
+static unsigned char g_asset_is_video[MAX_ASSETS];
 static int g_asset_count;
 static int g_next_page = 1; /* 0 = no more pages */
 
@@ -578,6 +586,7 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 			added++;
 			g_asset_ids[cur][0] = '\0';
 			g_asset_dates[cur][0] = '\0';
+			g_asset_is_video[cur] = 0;
 			continue;
 		}
 		if (cur < 0 || tok[i].type != JSMN_STRING || tok[i].size != 1 ||
@@ -598,6 +607,9 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 		else if (klen == 13 && !strncmp(k, "fileCreatedAt", 13) && vlen >= 10)
 			snprintf(g_asset_dates[cur], sizeof(g_asset_dates[0]),
 				 "%.10s", js + val->start);
+		else if (klen == 4 && !strncmp(k, "type", 4))
+			g_asset_is_video[cur] =
+				(vlen == 5 && !strncmp(js + val->start, "VIDEO", 5));
 	}
 	free(tok);
 
@@ -619,7 +631,7 @@ static int fetch_page(int is_first)
 	snprintf(url, sizeof(url), "%s/api/search/metadata", g_server);
 	char body[128];
 	snprintf(body, sizeof(body),
-		 "{\"page\":%d,\"size\":%d,\"type\":\"IMAGE\",\"order\":\"desc\"}",
+		 "{\"page\":%d,\"size\":%d,\"order\":\"desc\"}",
 		 g_next_page, PAGE_SIZE);
 
 	membuf buf;
@@ -932,6 +944,403 @@ static void draw_error_detail(int idx)
 }
 
 /* ------------------------------------------------------------------ */
+/* video download + playback                                           */
+/*                                                                     */
+/* The asset's transcoded playback stream is downloaded to the memory  */
+/* card, then played with SceAvPlayer (the OS's hardware MP4/H.264     */
+/* decoder). Frame buffers are CDRAM memblocks mapped into GXM, so     */
+/* decoded NV12 frames are drawn zero-copy by pointing a YUV texture   */
+/* at them. Audio runs on its own thread; sceAvPlayerGetVideoData      */
+/* paces video against it internally.                                  */
+/* ------------------------------------------------------------------ */
+
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
+
+/* draw an error screen until O is pressed */
+static void show_blocking_error(const char *title, const char *detail)
+{
+	SceCtrlData pad;
+	do {
+		sceCtrlPeekBufferPositive(0, &pad, 1);
+		vita2d_start_drawing();
+		vita2d_clear_screen();
+		draw_centered(230, RGBA8(255, 80, 80, 255), title);
+		if (detail && detail[0])
+			draw_centered(280, RGBA8(200, 200, 200, 255), detail);
+		draw_centered(510, RGBA8(160, 160, 160, 255), "O back");
+		vita2d_end_drawing();
+		vita2d_swap_buffers();
+	} while (!(pad.buttons & SCE_CTRL_CIRCLE));
+}
+
+static size_t file_write_cb(void *ptr, size_t size, size_t nmemb, void *ud)
+{
+	return fwrite(ptr, size, nmemb, (FILE *)ud);
+}
+
+static uint64_t g_dl_last_draw;
+
+static int dl_progress_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+			  curl_off_t ultotal, curl_off_t ulnow)
+{
+	SceCtrlData pad;
+	sceCtrlPeekBufferPositive(0, &pad, 1);
+	if (pad.buttons & SCE_CTRL_CIRCLE)
+		return 1; /* abort the transfer */
+
+	/* curl calls this very often; only redraw every 100 ms */
+	uint64_t now = sceKernelGetProcessTimeWide();
+	if (now - g_dl_last_draw < 100 * 1000)
+		return 0;
+	g_dl_last_draw = now;
+
+	char buf[128];
+	if (dltotal > 0)
+		snprintf(buf, sizeof(buf), "Downloading video... %.1f / %.1f MB",
+			 dlnow / (1024.0 * 1024.0), dltotal / (1024.0 * 1024.0));
+	else
+		snprintf(buf, sizeof(buf), "Downloading video... %.1f MB",
+			 dlnow / (1024.0 * 1024.0));
+
+	vita2d_start_drawing();
+	vita2d_clear_screen();
+	draw_centered(SCREEN_H / 2 - 20, RGBA8(255, 255, 255, 255), buf);
+	if (dltotal > 0) {
+		float frac = (float)dlnow / (float)dltotal;
+		vita2d_draw_rectangle(180, SCREEN_H / 2 + 10, 600, 14,
+				      RGBA8(60, 60, 60, 255));
+		vita2d_draw_rectangle(180, SCREEN_H / 2 + 10, 600.0f * frac, 14,
+				      RGBA8(120, 200, 120, 255));
+	}
+	draw_centered(SCREEN_H / 2 + 60, RGBA8(160, 160, 160, 255), "O cancel");
+	vita2d_end_drawing();
+	vita2d_swap_buffers();
+	return 0;
+}
+
+/* download the playback stream of asset idx to VIDEO_TMP_PATH.
+ * returns 0 on success, 1 if the user cancelled, -1 on error. */
+static int download_video(int idx, char *err, size_t errlen)
+{
+	char url[700];
+	snprintf(url, sizeof(url), "%s/api/assets/%s/video/playback",
+		 g_server, g_asset_ids[idx]);
+
+	FILE *f = fopen(VIDEO_TMP_PATH, "wb");
+	if (!f) {
+		snprintf(err, errlen, "cannot create %s", VIDEO_TMP_PATH);
+		return -1;
+	}
+
+	CURL *curl = curl_easy_init();
+	if (!curl) {
+		fclose(f);
+		snprintf(err, errlen, "curl init failed");
+		return -1;
+	}
+
+	char keyhdr[300];
+	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	struct curl_slist *hdrs = curl_slist_append(NULL, keyhdr);
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, file_write_cb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+	/* no overall timeout (videos can be big); abort on a 30 s stall */
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, dl_progress_cb);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "vitaImmich/0.1 (PS Vita)");
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	if (g_resolve_list)
+		curl_easy_setopt(curl, CURLOPT_RESOLVE, g_resolve_list);
+
+	g_dl_last_draw = 0;
+	CURLcode res = curl_easy_perform(curl);
+	long code = 0;
+	if (res == CURLE_OK)
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+	curl_slist_free_all(hdrs);
+	curl_easy_cleanup(curl);
+	fclose(f);
+
+	if (res == CURLE_ABORTED_BY_CALLBACK) {
+		sceIoRemove(VIDEO_TMP_PATH);
+		return 1;
+	}
+	if (res != CURLE_OK) {
+		snprintf(err, errlen, "curl error %d: %s", res,
+			 curl_easy_strerror(res));
+		sceIoRemove(VIDEO_TMP_PATH);
+		return -1;
+	}
+	if (code < 200 || code >= 300) {
+		snprintf(err, errlen, "HTTP %ld", code);
+		sceIoRemove(VIDEO_TMP_PATH);
+		return -1;
+	}
+	return 0;
+}
+
+static void *av_alloc(void *p, uint32_t alignment, uint32_t size)
+{
+	return memalign(alignment, size);
+}
+
+static void av_free(void *p, void *ptr)
+{
+	free(ptr);
+}
+
+/* video frame buffers must be GPU-visible: CDRAM memblocks mapped into GXM */
+static void *av_gpu_alloc(void *p, uint32_t alignment, uint32_t size)
+{
+	if (alignment < 0x40000)
+		alignment = 0x40000; /* CDRAM memblocks are 256 KiB granular */
+	size = ALIGN_UP(size, alignment);
+
+	SceKernelAllocMemBlockOpt opt;
+	memset(&opt, 0, sizeof(opt));
+	opt.size = sizeof(opt);
+	opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
+	opt.alignment = alignment;
+	SceUID mb = sceKernelAllocMemBlock("vimm_vframe",
+					   SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+					   size, &opt);
+	if (mb < 0) {
+		log_line("video: frame alloc failed (%u bytes): 0x%08x", size, mb);
+		return NULL;
+	}
+	void *base = NULL;
+	sceKernelGetMemBlockBase(mb, &base);
+	sceGxmMapMemory(base, size,
+			SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
+	return base;
+}
+
+static void av_gpu_free(void *p, void *ptr)
+{
+	SceUID mb = sceKernelFindMemBlockByAddr(ptr, 0);
+	sceGxmUnmapMemory(ptr);
+	if (mb >= 0)
+		sceKernelFreeMemBlock(mb);
+}
+
+static SceAvPlayerHandle g_avp;
+static volatile int g_av_audio_run;
+
+/* sceAudioOutOutput blocks until the previous chunk drains, so this
+ * thread is naturally paced by the audio hardware */
+static int video_audio_thread(SceSize args, void *argp)
+{
+	int port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, 1024, 48000,
+				       SCE_AUDIO_OUT_MODE_STEREO);
+	if (port < 0) {
+		log_line("video: audio port open failed: 0x%08x", port);
+		return 0;
+	}
+	int vol[2] = { 32767, 32767 };
+	sceAudioOutSetVolume(port, SCE_AUDIO_VOLUME_FLAG_L_CH |
+				   SCE_AUDIO_VOLUME_FLAG_R_CH, vol);
+
+	SceAvPlayerFrameInfo frame;
+	memset(&frame, 0, sizeof(frame));
+	while (g_av_audio_run) {
+		if (sceAvPlayerIsActive(g_avp) &&
+		    sceAvPlayerGetAudioData(g_avp, &frame)) {
+			sceAudioOutSetConfig(port, -1,
+					     frame.details.audio.sampleRate,
+					     frame.details.audio.channelCount == 1 ?
+					     SCE_AUDIO_OUT_MODE_MONO :
+					     SCE_AUDIO_OUT_MODE_STEREO);
+			sceAudioOutOutput(port, frame.pData);
+		} else {
+			sceKernelDelayThread(1000);
+		}
+	}
+	sceAudioOutReleasePort(port);
+	return 0;
+}
+
+/* play a local MP4 full screen; returns when it ends or O is pressed */
+static void play_video_file(const char *path)
+{
+	static int avplayer_module_loaded;
+	if (!avplayer_module_loaded) {
+		int mret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
+		log_line("video: load AVPLAYER module: 0x%08x", mret);
+		if (mret < 0) {
+			char det[64];
+			snprintf(det, sizeof(det), "sceSysmoduleLoadModule: 0x%08x",
+				 mret);
+			show_blocking_error("Could not load the video player module",
+					    det);
+			return;
+		}
+		avplayer_module_loaded = 1;
+	}
+
+	SceAvPlayerInitData init;
+	memset(&init, 0, sizeof(init));
+	init.memoryReplacement.allocate          = av_alloc;
+	init.memoryReplacement.deallocate        = av_free;
+	init.memoryReplacement.allocateTexture   = av_gpu_alloc;
+	init.memoryReplacement.deallocateTexture = av_gpu_free;
+	init.basePriority = 0xA0;
+	init.numOutputVideoFrameBuffers = 2;
+	init.autoStart = 1;
+	init.defaultLanguage = "eng";
+
+	/* the handle is a pointer to the player context (so often has bit 31
+	 * set); init failure returns 0, not a negative error code */
+	g_avp = sceAvPlayerInit(&init);
+	if (g_avp == 0) {
+		log_line("video: sceAvPlayerInit failed");
+		show_blocking_error("Could not start the video player",
+				    "sceAvPlayerInit returned NULL");
+		return;
+	}
+	log_line("video: player handle 0x%08x", g_avp);
+	int ret = sceAvPlayerAddSource(g_avp, path);
+	if (ret < 0) {
+		char det[64];
+		snprintf(det, sizeof(det), "sceAvPlayerAddSource: 0x%08x", ret);
+		log_line("video: %s", det);
+		sceAvPlayerClose(g_avp);
+		show_blocking_error("Could not open the video file", det);
+		return;
+	}
+
+	g_av_audio_run = 1;
+	SceUID audio_thid = sceKernelCreateThread("video_audio",
+						  video_audio_thread,
+						  0x10000100, 64 * 1024,
+						  0, 0, NULL);
+	if (audio_thid >= 0)
+		sceKernelStartThread(audio_thid, 0, NULL);
+
+	/* AddSource parses asynchronously; give it ~5 s to start */
+	int active = 0;
+	for (int i = 0; i < 300 && !(active = sceAvPlayerIsActive(g_avp)); i++)
+		show_status("Starting video...");
+
+	uint64_t duration = 0;
+	if (active) {
+		SceAvPlayerStreamInfo sinfo;
+		memset(&sinfo, 0, sizeof(sinfo));
+		if (sceAvPlayerGetStreamInfo(g_avp, 0, &sinfo) >= 0)
+			duration = sinfo.duration;
+	}
+
+	/* double-buffered frame wrappers: while the GPU still samples one
+	 * frame the decoder may already be filling the other */
+	vita2d_texture vtex[2];
+	SceAvPlayerFrameInfo vframe[2];
+	memset(vtex, 0, sizeof(vtex));
+	memset(vframe, 0, sizeof(vframe));
+	int buf_idx = 0;
+	vita2d_texture *cur = NULL;
+
+	int paused = 0;
+	unsigned int prev = 0xffffffff; /* swallow the X press that got us here */
+
+	while (active) {
+		SceCtrlData pad;
+		sceCtrlPeekBufferPositive(0, &pad, 1);
+		unsigned int pressed = pad.buttons & ~prev;
+		prev = pad.buttons;
+
+		if (pressed & SCE_CTRL_CIRCLE)
+			break;
+		if (pressed & SCE_CTRL_CROSS) {
+			if (paused)
+				sceAvPlayerResume(g_avp);
+			else
+				sceAvPlayerPause(g_avp);
+			paused = !paused;
+		}
+		if (!paused && (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT))) {
+			uint64_t t = sceAvPlayerCurrentTime(g_avp);
+			if (pressed & SCE_CTRL_RIGHT)
+				t += 10000;
+			else
+				t = t > 10000 ? t - 10000 : 0;
+			if (duration == 0 || t < duration)
+				sceAvPlayerJumpToTime(g_avp, t);
+		}
+
+		if (!sceAvPlayerIsActive(g_avp))
+			break; /* end of stream */
+
+		if (sceAvPlayerGetVideoData(g_avp, &vframe[buf_idx])) {
+			sceGxmTextureInitLinear(&vtex[buf_idx].gxm_tex,
+						vframe[buf_idx].pData,
+						SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1,
+						vframe[buf_idx].details.video.width,
+						vframe[buf_idx].details.video.height,
+						0);
+			cur = &vtex[buf_idx];
+			buf_idx ^= 1;
+		}
+
+		vita2d_start_drawing();
+		vita2d_clear_screen();
+		if (cur)
+			draw_texture_fitted(cur, 0, 0, SCREEN_W, SCREEN_H);
+
+		unsigned int cs = (unsigned int)(sceAvPlayerCurrentTime(g_avp) / 1000);
+		unsigned int ds = (unsigned int)(duration / 1000);
+		char hud[160];
+		snprintf(hud, sizeof(hud),
+			 "%u:%02u / %u:%02u%s    < > seek 10s    X %s    O back",
+			 cs / 60, cs % 60, ds / 60, ds % 60,
+			 paused ? "  [paused]" : "",
+			 paused ? "resume" : "pause");
+		draw_hud(hud);
+
+		vita2d_end_drawing();
+		vita2d_swap_buffers();
+	}
+
+	if (!active) {
+		log_line("video: player never became active (unsupported codec?)");
+		show_blocking_error("Could not play this video",
+				    "The Vita plays MP4 (H.264/AAC) only; "
+				    "check Immich transcoding settings.");
+	}
+
+	g_av_audio_run = 0;
+	if (audio_thid >= 0) {
+		sceKernelWaitThreadEnd(audio_thid, NULL, NULL);
+		sceKernelDeleteThread(audio_thid);
+	}
+	/* Close() frees the frame the GPU may still be sampling */
+	vita2d_wait_rendering_done();
+	sceAvPlayerStop(g_avp);
+	sceAvPlayerClose(g_avp);
+}
+
+/* download + play asset idx, cleaning up the temp file afterwards */
+static void view_video(int idx)
+{
+	char err[160];
+	int r = download_video(idx, err, sizeof(err));
+	if (r == 0) {
+		log_line("video %s: downloaded, playing", g_asset_ids[idx]);
+		play_video_file(VIDEO_TMP_PATH);
+	} else if (r < 0) {
+		log_line("video %s: %s", g_asset_ids[idx], err);
+		show_blocking_error("Failed to download video", err);
+	}
+	sceIoRemove(VIDEO_TMP_PATH);
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -984,7 +1393,7 @@ int main(void)
 	show_status("Loading library from %s ...", g_server);
 	fetch_page(1);
 	if (g_asset_count == 0)
-		fatal_error(NULL, "Server returned no image assets");
+		fatal_error(NULL, "Server returned no assets");
 
 	SceUID worker = sceKernelCreateThread("thumb_loader", worker_thread,
 					      0x10000100, 256 * 1024, 0, 0, NULL);
@@ -1121,6 +1530,15 @@ int main(void)
 				else
 					vita2d_draw_rectangle(bx, by, bw, bh,
 							      RGBA8(40, 40, 40, 255));
+				if (g_asset_is_video[i]) {
+					vita2d_draw_rectangle(bx, by + bh - 26,
+							      64, 26,
+							      RGBA8(0, 0, 0, 170));
+					vita2d_pgf_draw_text(g_font, bx + 6,
+							     by + bh - 7,
+							     RGBA8(255, 255, 255, 255),
+							     0.85f, "VIDEO");
+				}
 				if (i == sel)
 					draw_sel_outline(x + 2, y + 2,
 							 CELL_W - 4, CELL_H - 4);
@@ -1144,8 +1562,22 @@ int main(void)
 				mode = MODE_GRID;
 				continue;
 			}
-			if ((pressed & SCE_CTRL_CROSS) && detail_failed)
-				detail_idx = -1; /* retry */
+			if (pressed & SCE_CTRL_CROSS) {
+				if (detail_failed) {
+					detail_idx = -1; /* retry */
+				} else if (g_asset_is_video[sel]) {
+					view_video(sel);
+					/* wait for the buttons used inside the
+					 * player to be released, so they don't
+					 * also act on this screen */
+					do {
+						sceCtrlPeekBufferPositive(0, &pad, 1);
+						sceKernelDelayThread(10 * 1000);
+					} while (pad.buttons);
+					prev_buttons = 0;
+					continue;
+				}
+			}
 
 			if (detail_idx != sel) {
 				if (detail_tex) {
@@ -1171,11 +1603,12 @@ int main(void)
 			else
 				draw_error_detail(sel);
 
+			const char *xhint = detail_failed ? "X retry    " :
+					    g_asset_is_video[sel] ? "X play    " : "";
 			char hud[160];
 			snprintf(hud, sizeof(hud),
 				 "%d / %d    %s    < > browse    %sO back    START exit",
-				 sel + 1, g_asset_count, g_asset_dates[sel],
-				 detail_failed ? "X retry    " : "");
+				 sel + 1, g_asset_count, g_asset_dates[sel], xhint);
 			draw_hud(hud);
 
 			vita2d_end_drawing();

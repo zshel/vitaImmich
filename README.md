@@ -1,8 +1,9 @@
 # vitaImmich
 
 Minimal proof-of-concept [Immich](https://immich.app/) client for the PS Vita.
-It connects to your Immich server and shows your photo library as a scrollable
-chronological grid (newest first), with a full-screen viewer.
+It connects to your Immich server and shows your library (photos and videos)
+as a scrollable chronological grid (newest first), with a full-screen viewer
+and hardware-accelerated video playback.
 
 ## Requirements
 
@@ -60,17 +61,25 @@ Grid view:
 | ------------- | ------------------------------- |
 | D-pad         | Move selection (hold to repeat) |
 | L / R         | Jump two rows up / down         |
-| X             | Open photo full screen          |
+| X             | Open item full screen           |
 | START         | Exit                            |
 
 Full-screen view:
 
-| Button        | Action                  |
-| ------------- | ----------------------- |
-| Left / Right  | Previous / next photo   |
-| X             | Retry a failed photo    |
-| O             | Back to grid            |
-| START         | Exit                    |
+| Button        | Action                            |
+| ------------- | --------------------------------- |
+| Left / Right  | Previous / next item              |
+| X             | Play video / retry a failed photo |
+| O             | Back to grid                      |
+| START         | Exit                              |
+
+Video playback:
+
+| Button        | Action            |
+| ------------- | ----------------- |
+| X             | Pause / resume    |
+| Left / Right  | Seek ±10 seconds  |
+| O             | Stop and go back  |
 
 More of the library is fetched automatically (100 photos at a time, newest
 first) as you scroll toward the end. Errors are shown on screen and logged
@@ -82,4 +91,10 @@ to `ux0:data/vitaimmich/log.txt`.
   prefer plain HTTP on a trusted LAN or treat HTTPS as unverified.
 - Thumbnails stream in on a background thread (one at a time over a
   keep-alive connection); cells show a grey placeholder until loaded.
-- Caps at 1000 photos per launch; no albums, search, video or upload.
+- Videos are downloaded in full to `ux0:data/vitaimmich/video.mp4` before
+  playback (deleted afterwards), so they need free space on the memory card
+  and a moment to start. Playback uses the Vita's hardware decoder via
+  SceAvPlayer, so only MP4 (H.264/AAC) plays — Immich's transcoded
+  `video/playback` stream is used, which is H.264 with default server
+  settings.
+- Caps at 1000 assets per launch; no albums, search or upload.
