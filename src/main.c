@@ -661,67 +661,6 @@ static void jpeg_jmp_error_exit(j_common_ptr cinfo)
 	longjmp(e->jb, 1);
 }
 
-static vita2d_texture *decode_jpeg(const void *data, size_t size, int maxdim,
-				   char *err, size_t errlen)
-{
-	struct jpeg_decompress_struct ji;
-	struct jpeg_jmp_err jerr;
-	vita2d_texture *tex = NULL;
-
-	ji.err = jpeg_std_error(&jerr.mgr);
-	jerr.mgr.error_exit = jpeg_jmp_error_exit;
-	if (setjmp(jerr.jb)) {
-		snprintf(err, errlen, "libjpeg: %s", jerr.msg);
-		jpeg_destroy_decompress(&ji);
-		if (tex)
-			vita2d_free_texture(tex);
-		return NULL;
-	}
-
-	jpeg_create_decompress(&ji);
-	jpeg_mem_src(&ji, (void *)data, size);
-	jpeg_read_header(&ji, 1);
-
-	unsigned int longer = ji.image_width > ji.image_height ?
-			      ji.image_width : ji.image_height;
-	ji.scale_num = 1;
-	ji.scale_denom = 1;
-	while (longer / ji.scale_denom > (unsigned int)maxdim && ji.scale_denom < 8)
-		ji.scale_denom *= 2;
-
-	jpeg_start_decompress(&ji);
-
-	if (ji.output_components != 1 && ji.output_components != 3) {
-		snprintf(err, errlen, "unsupported JPEG: %d components (colorspace %d)",
-			 ji.output_components, ji.jpeg_color_space);
-		jpeg_abort_decompress(&ji);
-		jpeg_destroy_decompress(&ji);
-		return NULL;
-	}
-
-	SceGxmTextureFormat fmt = (ji.output_components == 1) ?
-		SCE_GXM_TEXTURE_FORMAT_U8_R111 : SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR;
-	tex = vita2d_create_empty_texture_format(ji.output_width,
-						 ji.output_height, fmt);
-	if (!tex) {
-		snprintf(err, errlen, "texture alloc failed (%ux%u)",
-			 ji.output_width, ji.output_height);
-		jpeg_abort_decompress(&ji);
-		jpeg_destroy_decompress(&ji);
-		return NULL;
-	}
-
-	unsigned char *row = vita2d_texture_get_datap(tex);
-	unsigned int stride = vita2d_texture_get_stride(tex);
-	while (ji.output_scanline < ji.output_height) {
-		jpeg_read_scanlines(&ji, &row, 1);
-		row += stride;
-	}
-
-	jpeg_finish_decompress(&ji);
-	jpeg_destroy_decompress(&ji);
-	return tex;
-}
 
 /* decode into a tightly packed malloc'd pixel buffer; no vita2d/GXM
  * calls, so this is safe to run on the loader thread */
@@ -954,64 +893,6 @@ static int fetch_page(int is_first)
 	return added;
 }
 
-/* download the preview JPEG of an asset and decode it to <= maxdim px */
-static vita2d_texture *load_image(int idx, int maxdim)
-{
-	char *err = g_tex_err[idx];
-	const size_t errlen = sizeof(g_tex_err[idx]);
-
-	char url[700];
-	snprintf(url, sizeof(url), "%s/api/assets/%s/thumbnail?size=preview",
-		 g_server, g_asset_ids[idx]);
-
-	membuf buf;
-	long code;
-	char ctype[80];
-	CURLcode res = http_request(url, NULL, &buf, &code, ctype, sizeof(ctype));
-
-	if (res != CURLE_OK) {
-		snprintf(err, errlen, "curl error %d: %s", res, curl_easy_strerror(res));
-		log_line("%s: %s", g_asset_ids[idx], err);
-		free(buf.data);
-		return NULL;
-	}
-	if (code < 200 || code >= 300) {
-		snprintf(err, errlen, "HTTP %ld: %.100s", code,
-			 buf.data ? buf.data : "(empty body)");
-		log_line("%s: %s", g_asset_ids[idx], err);
-		free(buf.data);
-		return NULL;
-	}
-	if (buf.size == 0) {
-		snprintf(err, errlen, "HTTP %ld but empty body (type %s)", code, ctype);
-		log_line("%s: %s", g_asset_ids[idx], err);
-		free(buf.data);
-		return NULL;
-	}
-
-	vita2d_texture *tex = NULL;
-	const unsigned char *p = (const unsigned char *)buf.data;
-	if (buf.size > 2 && p[0] == 0xff && p[1] == 0xd8) {
-		tex = decode_jpeg(buf.data, buf.size, maxdim, err, errlen);
-	} else if (buf.size > 8 && !memcmp(p, "\x89PNG", 4)) {
-		tex = vita2d_load_PNG_buffer(buf.data);
-		if (!tex)
-			snprintf(err, errlen, "PNG decode failed; %u bytes",
-				 (unsigned)buf.size);
-	} else if (buf.size > 12 && !memcmp(p, "RIFF", 4) && !memcmp(p + 8, "WEBP", 4)) {
-		snprintf(err, errlen, "got WebP (unsupported); %u bytes, type %s",
-			 (unsigned)buf.size, ctype);
-	} else {
-		snprintf(err, errlen,
-			 "unknown format; %u bytes, type %s, magic %02x %02x %02x %02x",
-			 (unsigned)buf.size, ctype, p[0], p[1],
-			 buf.size > 2 ? p[2] : 0, buf.size > 3 ? p[3] : 0);
-	}
-	if (!tex)
-		log_line("%s: %s", g_asset_ids[idx], err);
-	free(buf.data);
-	return tex;
-}
 
 /* ------------------------------------------------------------------ */
 /* background thumbnail loader                                         */
@@ -1029,6 +910,7 @@ enum { REQ_IDLE, REQ_PENDING, REQ_DONE };
 static volatile int g_req_state = REQ_IDLE;
 static volatile int g_req_idx = -1;
 static volatile int g_req_src = SRC_SERVER; /* SRC_SERVER or SRC_LOCAL */
+static volatile int g_req_detail;  /* full-res decode for the detail view */
 /* the request payload, copied here by the main thread before REQ_PENDING so
  * the worker never indexes the growable per-asset / per-local arrays (which
  * the main thread may realloc while a request is in flight). */
@@ -1168,7 +1050,9 @@ static int worker_thread(SceSize args, void *argp)
 			const unsigned char *p = (const unsigned char *)buf.data;
 			if (buf.size > 2 && p[0] == 0xff && p[1] == 0xd8) {
 				g_req_pix = decode_jpeg_buf(buf.data, buf.size,
-							    THUMB_MAX,
+							    g_req_detail ?
+								FULL_MAX :
+								THUMB_MAX,
 							    &g_req_w, &g_req_h,
 							    &g_req_comps,
 							    err, errlen);
@@ -1200,25 +1084,18 @@ static int worker_thread(SceSize args, void *argp)
 	return 0;
 }
 
-/* main-thread side: turn a finished worker result into a texture */
-static void consume_worker_result(void)
+/* build a texture from the worker's decoded result; `pooled` reuses the
+ * thumbnail recycle pool, the detail view creates/frees its own */
+static vita2d_texture *req_build_texture(char *err, size_t errlen, int pooled)
 {
-	int idx = g_req_idx;
-	int src = g_req_src;
-	char errbuf[64];
-	char *err = (src == SRC_LOCAL) ? errbuf : g_tex_err[idx];
-	size_t errlen = (src == SRC_LOCAL) ? sizeof(errbuf) :
-		    sizeof(g_tex_err[0]);
-	/* carry the worker's error text across (it wrote into g_req_err so it
-	 * never touched the growable arrays); main-side failures below overwrite */
-	snprintf(err, errlen, "%s", g_req_err);
 	vita2d_texture *tex = NULL;
 
 	if (g_req_pix) {
 		SceGxmTextureFormat fmt = (g_req_comps == 1) ?
 			SCE_GXM_TEXTURE_FORMAT_U8_R111 :
 			SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR;
-		tex = tex_acquire(g_req_w, g_req_h, fmt);
+		tex = pooled ? tex_acquire(g_req_w, g_req_h, fmt) :
+		      vita2d_create_empty_texture_format(g_req_w, g_req_h, fmt);
 		if (tex) {
 			unsigned char *dst = vita2d_texture_get_datap(tex);
 			unsigned int stride = vita2d_texture_get_stride(tex);
@@ -1240,6 +1117,33 @@ static void consume_worker_result(void)
 		free(g_req_raw);
 		g_req_raw = NULL;
 	}
+	return tex;
+}
+
+/* main-thread side: turn a finished worker result into a grid thumbnail */
+static void consume_worker_result(void)
+{
+	if (g_req_detail) {
+		/* a detail-view load whose result nobody wants anymore (the
+		 * user backed out to the grid mid-load): discard it */
+		free(g_req_pix);
+		g_req_pix = NULL;
+		free(g_req_raw);
+		g_req_raw = NULL;
+		g_req_state = REQ_IDLE;
+		return;
+	}
+
+	int idx = g_req_idx;
+	int src = g_req_src;
+	char errbuf[64];
+	char *err = (src == SRC_LOCAL) ? errbuf : g_tex_err[idx];
+	size_t errlen = (src == SRC_LOCAL) ? sizeof(errbuf) :
+		    sizeof(g_tex_err[0]);
+	/* carry the worker's error text across (it wrote into g_req_err so it
+	 * never touched the growable arrays); main-side failures below overwrite */
+	snprintf(err, errlen, "%s", g_req_err);
+	vita2d_texture *tex = req_build_texture(err, errlen, 1);
 
 	if (src == SRC_LOCAL) {
 		g_local_thumb[idx] = tex;
@@ -1249,6 +1153,23 @@ static void consume_worker_result(void)
 		g_thumb_failed[idx] = (tex == NULL);
 	}
 	g_req_state = REQ_IDLE;
+}
+
+/* main-thread side: turn a finished detail-view load into its texture */
+static vita2d_texture *consume_detail_result(void)
+{
+	int src = g_req_src;
+	char errbuf[160];
+	char *err = (src == SRC_LOCAL) ? errbuf : g_tex_err[g_req_idx];
+	size_t errlen = (src == SRC_LOCAL) ? sizeof(errbuf) :
+		    sizeof(g_tex_err[0]);
+	snprintf(err, errlen, "%s", g_req_err);
+	vita2d_texture *tex = req_build_texture(err, errlen, 0);
+	if (!tex)
+		log_line("detail %s: %s",
+			 src == SRC_LOCAL ? g_req_path : g_req_id, err);
+	g_req_state = REQ_IDLE;
+	return tex;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2697,42 +2618,6 @@ static int queue_all_uploads(void)
 	return n;
 }
 
-/* load a local photo full-size into a texture (main thread; reads the file
- * then decodes with libjpeg / vita2d's PNG loader) */
-static vita2d_texture *load_local_image(int j, char *err, size_t errlen)
-{
-	FILE *f = fopen(g_local_path[j], "rb");
-	if (!f) {
-		snprintf(err, errlen, "open failed");
-		return NULL;
-	}
-	fseek(f, 0, SEEK_END);
-	long sz = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	char *data = (sz > 0) ? malloc(sz + 1) : NULL;
-	if (!data) {
-		fclose(f);
-		snprintf(err, errlen, "out of memory (%ld bytes)", sz);
-		return NULL;
-	}
-	size_t got = fread(data, 1, sz, f);
-	data[got] = '\0';
-	fclose(f);
-
-	vita2d_texture *tex = NULL;
-	const unsigned char *p = (const unsigned char *)data;
-	if (got > 2 && p[0] == 0xff && p[1] == 0xd8) {
-		tex = decode_jpeg(data, got, FULL_MAX, err, errlen);
-	} else if (got > 8 && !memcmp(p, "\x89PNG", 4)) {
-		tex = vita2d_load_PNG_buffer(data);
-		if (!tex)
-			snprintf(err, errlen, "PNG decode failed");
-	} else {
-		snprintf(err, errlen, "unknown format");
-	}
-	free(data);
-	return tex;
-}
 
 /* ------------------------------------------------------------------ */
 /* grid status badges + sync overview                                  */
@@ -2939,6 +2824,8 @@ int main(void)
 	vita2d_texture *detail_tex = NULL;
 	int detail_idx = -1;
 	int detail_failed = 0;
+	int detail_loading = 0;  /* full-res load in flight on the worker */
+	int detail_issued = 0;   /* the worker request has been handed over */
 	float zoom = 1.0f, panx = 0.0f, pany = 0.0f;
 
 	for (;;) {
@@ -3127,6 +3014,7 @@ int main(void)
 					struct disp_item *it = &g_disp[next];
 					g_req_idx = it->idx;
 					g_req_src = it->src;
+					g_req_detail = 0;
 					/* copy the payload so the worker needn't
 					 * index arrays we may realloc */
 					if (it->src == SRC_LOCAL) {
@@ -3239,7 +3127,11 @@ int main(void)
 					sel--;
 			}
 			if (pressed & SCE_CTRL_CIRCLE) {
+				/* back to the grid; if a full-res load is in
+				 * flight its result gets discarded there */
 				mode = MODE_GRID;
+				detail_idx = -1;
+				detail_loading = 0;
 				continue;
 			}
 			if (pressed & SCE_CTRL_CROSS) {
@@ -3279,43 +3171,74 @@ int main(void)
 					vita2d_free_texture(detail_tex);
 					detail_tex = NULL;
 				}
-				if (is_video) {
-					/* nothing to decode; X plays it */
-					detail_tex = NULL;
-					detail_failed = 0;
-				} else {
-					show_status("Loading photo %d/%d ...",
-						    sel + 1, g_disp_count);
-					if (is_local) {
-						char e[160];
-						detail_tex = load_local_image(it.idx,
-									      e, sizeof(e));
-						if (!detail_tex)
-							log_line("local %s: %s",
-								 g_local_path[it.idx], e);
-					} else {
-						detail_tex = load_image(it.idx, FULL_MAX);
+				detail_failed = 0;
+				/* photos load asynchronously on the worker;
+				 * the blown-up grid thumb shows meanwhile and
+				 * O stays responsive (videos: X plays) */
+				detail_loading = !is_video;
+				detail_issued = 0;
+				detail_idx = sel;
+			}
+
+			/* drive the async full-res load */
+			if (detail_loading) {
+				if (!detail_issued) {
+					if (g_req_state == REQ_DONE) {
+						__sync_synchronize();
+						consume_worker_result();
 					}
+					if (g_req_state == REQ_IDLE) {
+						g_req_idx = it.idx;
+						g_req_src = it.src;
+						g_req_detail = 1;
+						g_req_is_video = 0;
+						if (is_local)
+							snprintf(g_req_path,
+								 sizeof(g_req_path), "%s",
+								 g_local_path[it.idx]);
+						else
+							snprintf(g_req_id,
+								 sizeof(g_req_id), "%s",
+								 g_asset_ids[it.idx]);
+						__sync_synchronize();
+						g_req_state = REQ_PENDING;
+						detail_issued = 1;
+					}
+				} else if (g_req_state == REQ_DONE) {
+					__sync_synchronize();
+					detail_tex = consume_detail_result();
+					detail_loading = 0;
 					detail_failed = (detail_tex == NULL);
 				}
-				detail_idx = sel;
 			}
 
 			vita2d_start_drawing();
 			vita2d_clear_screen();
 
-			if (detail_tex)
+			if (detail_tex) {
 				draw_texture_zoom(detail_tex, zoom, &panx, &pany);
-			else if (is_video)
+			} else if (is_video) {
 				draw_centered(SCREEN_H / 2,
 					      RGBA8(200, 200, 200, 255),
 					      "Press X to play this video");
-			else if (it.src == SRC_SERVER)
+			} else if (detail_loading) {
+				/* low-res grid thumb blown up while the full
+				 * image is still on its way */
+				vita2d_texture *th = disp_thumb(sel);
+				if (th)
+					draw_texture_fitted(th, 0, 0,
+							    SCREEN_W, SCREEN_H);
+				else
+					draw_centered(SCREEN_H / 2,
+						      RGBA8(160, 160, 160, 255),
+						      "Loading...");
+			} else if (it.src == SRC_SERVER) {
 				draw_error_detail(it.idx);
-			else
+			} else {
 				draw_centered(SCREEN_H / 2,
 					      RGBA8(255, 80, 80, 255),
 					      "Failed to load this photo");
+			}
 
 			const char *xhint = detail_failed ? "X retry    " :
 					    is_video ? "X play    " : "";
@@ -3326,9 +3249,11 @@ int main(void)
 					 sel + 1, g_disp_count, zoom * 100.0f);
 			else
 				snprintf(hud, sizeof(hud),
-					 "%d / %d    %.19s    < > browse  L/R zoom  %sO back",
+					 "%d / %d    %.19s    %s< > browse  L/R zoom  %sO back",
 					 sel + 1, g_disp_count,
-					 g_disp_count > 0 ? disp_date(sel) : "", xhint);
+					 g_disp_count > 0 ? disp_date(sel) : "",
+					 detail_loading ? "loading...  " : "",
+					 xhint);
 			draw_hud(hud);
 
 			vita2d_end_drawing();
