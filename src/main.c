@@ -25,6 +25,7 @@
 #include <psp2/audioout.h>
 #include <psp2/avplayer.h>
 #include <psp2/ctrl.h>
+#include <psp2/display.h>
 #include <psp2/gxm.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/io/fcntl.h>
@@ -40,6 +41,7 @@
 #include <vita2d.h>
 #include <curl/curl.h>
 #include <jpeglib.h>
+#include <openssl/crypto.h>
 #include <openssl/sha.h>
 
 #define JSMN_STATIC
@@ -53,14 +55,12 @@
 #define CELL_W     240
 #define CELL_H     240
 #define CELL_PAD   6
+#define HEADER_H   40            /* month/year band height in the grid */
 #define THUMB_MAX  256   /* decode grid thumbs down to <= this dimension */
 #define FULL_MAX   4096  /* GXM texture size limit */
 
 #define PAGE_SIZE  100
-#define MAX_ASSETS 1000
-#define MAX_LOCAL  500           /* cap on local camera files scanned */
 #define DATELEN    20            /* "YYYY-MM-DDTHH:MM:SS" + NUL, sortable */
-#define DISP_MAX   (MAX_ASSETS + MAX_LOCAL)
 
 #define CONFIG_DIR  "ux0:data/vitaimmich"
 #define CONFIG_PATH CONFIG_DIR "/config.txt"
@@ -84,18 +84,23 @@ static long g_syncmax_mb = 512;
 
 static vita2d_pgf *g_font;
 
-static char g_asset_ids[MAX_ASSETS][40];
-static char g_asset_dates[MAX_ASSETS][DATELEN]; /* YYYY-MM-DDTHH:MM:SS */
-static unsigned char g_asset_is_video[MAX_ASSETS];
+/* server-asset arrays. dynamically grown (doubling) as pages are fetched, so
+ * the library is bounded only by memory, not a fixed cap. grown on the main
+ * thread; the thumb worker never indexes these (it reads dedicated request
+ * buffers), so a realloc here can't dangle a pointer under it. */
+static char (*g_asset_ids)[40];
+static char (*g_asset_dates)[DATELEN]; /* YYYY-MM-DDTHH:MM:SS */
+static unsigned char *g_asset_is_video;
 /* set during display rebuild: a backed-up local file matches this server
  * asset, so its grid cell shows the green "backed up" badge */
-static unsigned char g_asset_local_backed[MAX_ASSETS];
+static unsigned char *g_asset_local_backed;
 static int g_asset_count;
+static int g_asset_cap;
 static int g_next_page = 1; /* 0 = no more pages */
 
-static vita2d_texture *g_thumb[MAX_ASSETS];
-static int g_thumb_failed[MAX_ASSETS];
-static char g_tex_err[MAX_ASSETS][160];
+static vita2d_texture **g_thumb;
+static int *g_thumb_failed;
+static char (*g_tex_err)[160];
 
 /* ------------------------------------------------------------------ */
 /* local camera media + sync state                                     */
@@ -115,26 +120,56 @@ enum {
 	SYNC_FAILED,     /* upload/check error (see g_local_err) */
 };
 
-static char g_local_path[MAX_LOCAL][256];
-static char g_local_date[MAX_LOCAL][DATELEN]; /* sortable mtime */
-static char g_local_sha1[MAX_LOCAL][41];      /* lowercase hex */
-static char g_local_server_id[MAX_LOCAL][40]; /* assetId once backed up */
-static char g_local_err[MAX_LOCAL][96];
-static SceDateTime g_local_mtime[MAX_LOCAL];
-static SceDateTime g_local_ctime[MAX_LOCAL];
-static long long g_local_size[MAX_LOCAL];
-static unsigned char g_local_is_video[MAX_LOCAL];
-static volatile int g_local_state[MAX_LOCAL];
+/* local camera-media arrays. grown (doubling) during the one-shot startup
+ * scan, then fixed for the rest of the run, so the sync thread can read them
+ * without a realloc moving the storage out from under it. */
+static char (*g_local_path)[256];
+static char (*g_local_date)[DATELEN]; /* sortable mtime */
+static char (*g_local_sha1)[41];      /* lowercase hex */
+static char (*g_local_server_id)[40]; /* assetId once backed up */
+static char (*g_local_err)[96];
+static SceDateTime *g_local_mtime;
+static SceDateTime *g_local_ctime;
+static long long *g_local_size;
+static unsigned char *g_local_is_video;
+static volatile int *g_local_state;
 static int g_local_count;
+static int g_local_cap;
 
-static vita2d_texture *g_local_thumb[MAX_LOCAL];
-static int g_local_thumb_failed[MAX_LOCAL];
+static vita2d_texture **g_local_thumb;
+static int *g_local_thumb_failed;
 
 /* merged, date-desc display order of server + local items */
 enum { SRC_SERVER, SRC_LOCAL };
 struct disp_item { unsigned char src; int idx; };
-static struct disp_item g_disp[DISP_MAX];
+static struct disp_item *g_disp;
 static int g_disp_count;
+static int g_disp_cap;
+
+/* per-display-slot grid layout (filled by layout_grid): pixel position of the
+ * cell, plus the month/year section headers shown above each month's run */
+static float *g_item_x;
+static float *g_item_y;
+struct sect_hdr { float y; char label[24]; };
+static struct sect_hdr *g_sect;
+static int g_sect_count;
+static int g_sect_cap;
+static float g_content_h; /* total scrollable height incl. headers */
+
+/* Texture recycling pool. Freeing a texture unmaps its memblock, and the
+ * GPU side (notably Vita3K's texture cache, which re-reads guest memory of
+ * cached textures at its own pace) may still touch it afterwards — freeing
+ * evicted thumbnails crashes intermittently no matter how long the free is
+ * deferred. So thumbnails are never freed while browsing: released textures
+ * go into this pool and get reused for the next thumb with the same
+ * dimensions+format (Immich previews come in a handful of sizes, so the hit
+ * rate is high and the pool stays small). */
+#define TEXPOOL_MAX 160
+static vita2d_texture *g_texpool[TEXPOOL_MAX];
+static int g_texpool_n;
+
+static void tex_release(vita2d_texture *tex);
+static vita2d_texture *tex_acquire(int w, int h, SceGxmTextureFormat fmt);
 
 /* the sync thread asks the main thread to rebuild g_disp (which the main
  * thread also reads every frame) by setting this; one writer per side */
@@ -146,6 +181,92 @@ static char g_sync_activity[160];
 static volatile curl_off_t g_ul_now, g_ul_total;
 static char g_sync_errlog[5][160];
 static volatile int g_sync_errn;
+
+static void log_line(const char *fmt, ...);
+
+/* grow *pp to hold `need` elements of `elem` bytes, doubling from `cur` cap;
+ * zero the freshly added tail (callers rely on NULL thumbs / zero state).
+ * returns the new capacity, or 0 on allocation failure. */
+static int grow_array(void **pp, int cur, int need, size_t elem)
+{
+	if (need <= cur)
+		return cur;
+	int cap = cur ? cur : 64;
+	while (cap < need)
+		cap *= 2;
+	void *np = realloc(*pp, (size_t)cap * elem);
+	if (!np)
+		return 0;
+	memset((char *)np + (size_t)cur * elem, 0, (size_t)(cap - cur) * elem);
+	*pp = np;
+	return cap;
+}
+
+#define GROW(arr, capvar, need) \
+	grow_array((void **)&(arr), (capvar), (need), sizeof(*(arr)))
+
+/* ensure the server-asset arrays hold at least `need` entries */
+static int grow_assets(int need)
+{
+	int c = g_asset_cap;
+	if (need <= c)
+		return 1;
+	if (!GROW(g_asset_ids, c, need) ||
+	    !GROW(g_asset_dates, c, need) ||
+	    !GROW(g_asset_is_video, c, need) ||
+	    !GROW(g_asset_local_backed, c, need) ||
+	    !GROW(g_thumb, c, need) ||
+	    !GROW(g_thumb_failed, c, need) ||
+	    !(g_asset_cap = GROW(g_tex_err, c, need)))
+		return 0;
+	return 1;
+}
+
+/* ensure the local-media arrays hold at least `need` entries */
+static int grow_locals(int need)
+{
+	int c = g_local_cap;
+	if (need <= c)
+		return 1;
+	if (!GROW(g_local_path, c, need) ||
+	    !GROW(g_local_date, c, need) ||
+	    !GROW(g_local_sha1, c, need) ||
+	    !GROW(g_local_server_id, c, need) ||
+	    !GROW(g_local_err, c, need) ||
+	    !GROW(g_local_mtime, c, need) ||
+	    !GROW(g_local_ctime, c, need) ||
+	    !GROW(g_local_size, c, need) ||
+	    !GROW(g_local_is_video, c, need) ||
+	    !GROW(g_local_state, c, need) ||
+	    !GROW(g_local_thumb, c, need) ||
+	    !(g_local_cap = GROW(g_local_thumb_failed, c, need)))
+		return 0;
+	return 1;
+}
+
+/* the merged timeline + its per-slot grid positions share one capacity */
+static int grow_disp(int need)
+{
+	int c = g_disp_cap;
+	if (need <= c)
+		return 1;
+	if (!GROW(g_disp, c, need) ||
+	    !GROW(g_item_x, c, need) ||
+	    !(g_disp_cap = GROW(g_item_y, c, need)))
+		return 0;
+	return 1;
+}
+
+static int grow_sect(int need)
+{
+	if (need <= g_sect_cap)
+		return 1;
+	int cap = GROW(g_sect, g_sect_cap, need);
+	if (!cap)
+		return 0;
+	g_sect_cap = cap;
+	return 1;
+}
 
 static void log_line(const char *fmt, ...)
 {
@@ -339,8 +460,68 @@ static int load_config(void)
 
 static char g_net_mem[1024 * 1024];
 
+/* OpenSSL 1.0.2 is not thread-safe unless the application installs locking
+ * callbacks. Three threads here do concurrent HTTPS (main page fetches, the
+ * thumbnail worker, the sync thread); without these locks, overlapping TLS
+ * work corrupts OpenSSL's shared state and crashes deep inside the cipher
+ * (seen as wild reads/writes in CRYPTO_gcm128_decrypt while fast-scrolling,
+ * which is exactly when a page fetch overlaps thumbnail downloads). */
+static SceUID *g_ssl_locks;
+
+/* vitasdk's OpenSSL 1.0.2 is built without thread support (opensslconf.h
+ * defines no OPENSSL_THREADS), so even with locking callbacks installed,
+ * concurrent TLS on multiple threads corrupts its global state — crashes
+ * surface deep in the cipher (CRYPTO_gcm128_decrypt) when a page fetch on
+ * the main thread overlaps a thumbnail download on the worker. Serialize
+ * every curl_easy_perform behind this mutex instead. */
+static SceUID g_net_mutex = -1;
+
+static void net_lock(void)
+{
+	if (g_net_mutex >= 0)
+		sceKernelLockMutex(g_net_mutex, 1, NULL);
+}
+
+static void net_unlock(void)
+{
+	if (g_net_mutex >= 0)
+		sceKernelUnlockMutex(g_net_mutex, 1);
+}
+
+static void ssl_lock_cb(int mode, int n, const char *file, int line)
+{
+	(void)file; (void)line;
+	if (mode & CRYPTO_LOCK)
+		sceKernelLockMutex(g_ssl_locks[n], 1, NULL);
+	else
+		sceKernelUnlockMutex(g_ssl_locks[n], 1);
+}
+
+static unsigned long ssl_thread_id_cb(void)
+{
+	return (unsigned long)sceKernelGetThreadId();
+}
+
+static void ssl_locks_init(void)
+{
+	int n = CRYPTO_num_locks();
+	g_ssl_locks = malloc(n * sizeof(SceUID));
+	if (!g_ssl_locks)
+		return;
+	for (int i = 0; i < n; i++) {
+		char name[32];
+		snprintf(name, sizeof(name), "ssl_lock_%d", i);
+		g_ssl_locks[i] = sceKernelCreateMutex(name, 0, 0, NULL);
+	}
+	CRYPTO_set_id_callback(ssl_thread_id_cb);
+	CRYPTO_set_locking_callback(ssl_lock_cb);
+	log_line("openssl locking callbacks installed (%d locks)", n);
+}
+
 static void net_init(void)
 {
+	g_net_mutex = sceKernelCreateMutex("net_mutex", 0, 0, NULL);
+	ssl_locks_init();
 	sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
 	if (sceNetShowNetstat() == SCE_NET_ERROR_ENOTINIT) {
 		SceNetInitParam param = {
@@ -435,7 +616,9 @@ static CURLcode http_request(const char *url, const char *body,
 		curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, curl_debug_cb);
 	}
 
+	net_lock(); /* TLS is single-threaded, see g_net_mutex */
 	CURLcode res = curl_easy_perform(curl);
+	net_unlock();
 	if (g_verbose_request) {
 		log_line("curl: perform result=%d (%s)", res, curl_easy_strerror(res));
 		g_verbose_request = 0;
@@ -670,8 +853,8 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 	int cur = -1, cur_obj = -1;
 	for (int i = arr_idx + 1; i < ntok; i++) {
 		if (tok[i].type == JSMN_OBJECT && tok[i].parent == arr_idx) {
-			if (g_asset_count >= MAX_ASSETS)
-				break;
+			if (!grow_assets(g_asset_count + 1))
+				break; /* out of memory: keep what we have */
 			cur = g_asset_count++;
 			cur_obj = i;
 			added++;
@@ -718,7 +901,7 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 /* fetch the next page of the library, newest first; returns assets added */
 static int fetch_page(int is_first)
 {
-	if (g_next_page <= 0 || g_asset_count >= MAX_ASSETS)
+	if (g_next_page <= 0)
 		return 0;
 
 	char url[600];
@@ -846,6 +1029,13 @@ enum { REQ_IDLE, REQ_PENDING, REQ_DONE };
 static volatile int g_req_state = REQ_IDLE;
 static volatile int g_req_idx = -1;
 static volatile int g_req_src = SRC_SERVER; /* SRC_SERVER or SRC_LOCAL */
+/* the request payload, copied here by the main thread before REQ_PENDING so
+ * the worker never indexes the growable per-asset / per-local arrays (which
+ * the main thread may realloc while a request is in flight). */
+static char g_req_id[40];          /* server asset id  */
+static char g_req_path[256];       /* local file path  */
+static int g_req_is_video;
+static char g_req_err[160];        /* worker -> main error text */
 static unsigned char *g_req_pix;   /* decoded pixels, or NULL on failure */
 static int g_req_w, g_req_h, g_req_comps;
 static char *g_req_raw;            /* raw body when it's a PNG */
@@ -888,15 +1078,14 @@ static int worker_thread(SceSize args, void *argp)
 			sceKernelDelayThread(2000);
 			continue;
 		}
-		int idx = g_req_idx;
+		/* the request is fully described by the g_req_* buffers the main
+		 * thread filled before REQ_PENDING; never touch the growable
+		 * arrays here (they may move under us). */
 		int src = g_req_src;
-		char local_err[160];
-		local_err[0] = '\0';
-		char *err = (src == SRC_LOCAL) ? local_err : g_tex_err[idx];
-		const size_t errlen = (src == SRC_LOCAL) ?
-			sizeof(local_err) : sizeof(g_tex_err[idx]);
-		const char *label = (src == SRC_LOCAL) ?
-			g_local_path[idx] : g_asset_ids[idx];
+		char *err = g_req_err;
+		const size_t errlen = sizeof(g_req_err);
+		err[0] = '\0';
+		const char *label = (src == SRC_LOCAL) ? g_req_path : g_req_id;
 		g_req_pix = NULL;
 		g_req_raw = NULL;
 
@@ -904,7 +1093,7 @@ static int worker_thread(SceSize args, void *argp)
 		 * instead. guard against a concurrently playing video — set
 		 * our flag first, then yield while the player holds the
 		 * decoder (lock order mirrors play_video_file, see above). */
-		if (src == SRC_LOCAL && g_local_is_video[idx]) {
+		if (src == SRC_LOCAL && g_req_is_video) {
 			g_poster_active = 1;
 			__sync_synchronize();
 			while (g_player_active) {
@@ -914,7 +1103,7 @@ static int worker_thread(SceSize args, void *argp)
 				g_poster_active = 1;
 				__sync_synchronize();
 			}
-			g_req_pix = extract_video_poster(g_local_path[idx],
+			g_req_pix = extract_video_poster(g_req_path,
 							 &g_req_w, &g_req_h,
 							 err, errlen);
 			if (g_req_pix)
@@ -934,7 +1123,7 @@ static int worker_thread(SceSize args, void *argp)
 
 		if (src == SRC_LOCAL) {
 			/* read the camera JPEG/PNG off the memory card */
-			FILE *lf = fopen(g_local_path[idx], "rb");
+			FILE *lf = fopen(g_req_path, "rb");
 			if (!lf) {
 				snprintf(err, errlen, "open failed");
 			} else {
@@ -956,10 +1145,12 @@ static int worker_thread(SceSize args, void *argp)
 			char url[700];
 			snprintf(url, sizeof(url),
 				 "%s/api/assets/%s/thumbnail?size=preview",
-				 g_server, g_asset_ids[idx]);
+				 g_server, g_req_id);
 			curl_easy_setopt(curl, CURLOPT_URL, url);
 			curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+			net_lock(); /* TLS is single-threaded, see g_net_mutex */
 			res = curl_easy_perform(curl);
+			net_unlock();
 			if (res == CURLE_OK)
 				curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
 		}
@@ -1015,17 +1206,19 @@ static void consume_worker_result(void)
 	int idx = g_req_idx;
 	int src = g_req_src;
 	char errbuf[64];
-	char *err = (src == SRC_LOCAL) ? errbuf :
-		    g_tex_err[idx];
+	char *err = (src == SRC_LOCAL) ? errbuf : g_tex_err[idx];
 	size_t errlen = (src == SRC_LOCAL) ? sizeof(errbuf) :
-		    sizeof(g_tex_err[idx]);
+		    sizeof(g_tex_err[0]);
+	/* carry the worker's error text across (it wrote into g_req_err so it
+	 * never touched the growable arrays); main-side failures below overwrite */
+	snprintf(err, errlen, "%s", g_req_err);
 	vita2d_texture *tex = NULL;
 
 	if (g_req_pix) {
 		SceGxmTextureFormat fmt = (g_req_comps == 1) ?
 			SCE_GXM_TEXTURE_FORMAT_U8_R111 :
 			SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR;
-		tex = vita2d_create_empty_texture_format(g_req_w, g_req_h, fmt);
+		tex = tex_acquire(g_req_w, g_req_h, fmt);
 		if (tex) {
 			unsigned char *dst = vita2d_texture_get_datap(tex);
 			unsigned int stride = vita2d_texture_get_stride(tex);
@@ -1056,6 +1249,40 @@ static void consume_worker_result(void)
 		g_thumb_failed[idx] = (tex == NULL);
 	}
 	g_req_state = REQ_IDLE;
+}
+
+/* ------------------------------------------------------------------ */
+/* texture recycling pool (see g_texpool above)                        */
+/* ------------------------------------------------------------------ */
+
+/* release a texture into the pool; never vita2d_free_texture mid-run */
+static void tex_release(vita2d_texture *tex)
+{
+	if (!tex)
+		return;
+	if (g_texpool_n < TEXPOOL_MAX) {
+		g_texpool[g_texpool_n++] = tex;
+		return;
+	}
+	/* pool full: freeing is the crash hazard, so prefer leaking the
+	 * oldest entry's slot over freeing. Shouldn't happen in practice
+	 * (steady-state live+pooled thumbs stay well under the cap). */
+	log_line("texpool full, leaking a texture");
+}
+
+/* get a texture of exactly w x h in `fmt`, reusing a pooled one if any */
+static vita2d_texture *tex_acquire(int w, int h, SceGxmTextureFormat fmt)
+{
+	for (int i = 0; i < g_texpool_n; i++) {
+		vita2d_texture *t = g_texpool[i];
+		if ((int)vita2d_texture_get_width(t) == w &&
+		    (int)vita2d_texture_get_height(t) == h &&
+		    vita2d_texture_get_format(t) == fmt) {
+			g_texpool[i] = g_texpool[--g_texpool_n];
+			return t;
+		}
+	}
+	return vita2d_create_empty_texture_format(w, h, fmt);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1118,6 +1345,67 @@ static int disp_cmp(const void *a, const void *b)
 	return strcmp(dy, dx); /* newest first */
 }
 
+/* turn a sortable "YYYY-MM-..." date into a "Month YYYY" section title */
+static void month_label(const char *date, char *out, size_t len)
+{
+	static const char *const mon[] = {
+		"", "January", "February", "March", "April", "May", "June",
+		"July", "August", "September", "October", "November", "December"
+	};
+	int y = 0, m = 0;
+	if (strlen(date) >= 7) {
+		y = (date[0] - '0') * 1000 + (date[1] - '0') * 100 +
+		    (date[2] - '0') * 10 + (date[3] - '0');
+		m = (date[5] - '0') * 10 + (date[6] - '0');
+	}
+	if (m < 1 || m > 12)
+		snprintf(out, len, "Unknown date");
+	else
+		snprintf(out, len, "%s %d", mon[m], y);
+}
+
+/* compute each display slot's grid cell + the month/year header bands. the
+ * timeline is already date-desc sorted, so a run of equal "YYYY-MM" is one
+ * month; every month starts on a fresh row under its own header. */
+static void layout_grid(void)
+{
+	g_sect_count = 0;
+	float y = 0.0f;
+	int col = 0;
+	char curkey[8] = "";
+
+	for (int d = 0; d < g_disp_count; d++) {
+		const char *date = disp_date(d);
+		char key[8];
+		snprintf(key, sizeof(key), "%.7s", date); /* YYYY-MM */
+
+		if (strcmp(key, curkey) != 0) {
+			if (col != 0) { /* finish the partial last row */
+				y += CELL_H;
+				col = 0;
+			}
+			if (grow_sect(g_sect_count + 1)) {
+				g_sect[g_sect_count].y = y;
+				month_label(date, g_sect[g_sect_count].label,
+					    sizeof(g_sect[0].label));
+				g_sect_count++;
+			}
+			y += HEADER_H;
+			snprintf(curkey, sizeof(curkey), "%s", key);
+		}
+
+		g_item_x[d] = (float)col * CELL_W;
+		g_item_y[d] = y;
+		if (++col == COLS) {
+			col = 0;
+			y += CELL_H;
+		}
+	}
+	if (col != 0)
+		y += CELL_H;
+	g_content_h = y;
+}
+
 /* rebuild the merged, date-desc display order. main-thread only (the grid
  * reads g_disp every frame). a backed-up local file that matches a fetched
  * server asset is shown once, as the server asset (green badge). */
@@ -1126,13 +1414,16 @@ static void rebuild_display(void)
 	for (int i = 0; i < g_asset_count; i++)
 		g_asset_local_backed[i] = 0;
 
+	if (!grow_disp(g_asset_count + g_local_count))
+		return; /* keep the previous layout if we can't size the new one */
+
 	int n = 0;
-	for (int i = 0; i < g_asset_count && n < DISP_MAX; i++) {
+	for (int i = 0; i < g_asset_count; i++) {
 		g_disp[n].src = SRC_SERVER;
 		g_disp[n].idx = i;
 		n++;
 	}
-	for (int j = 0; j < g_local_count && n < DISP_MAX; j++) {
+	for (int j = 0; j < g_local_count; j++) {
 		if (g_local_state[j] == SYNC_BACKED_UP &&
 		    server_has_id(g_local_server_id[j])) {
 			/* fold into the matching server cell */
@@ -1149,6 +1440,7 @@ static void rebuild_display(void)
 	}
 	g_disp_count = n;
 	qsort(g_disp, n, sizeof(g_disp[0]), disp_cmp);
+	layout_grid();
 }
 
 /* find the display slot for a given source item (after a rebuild reorders
@@ -1170,10 +1462,10 @@ static int pick_next_load(int sel, int first_vis, int last_vis)
 	for (int i = first_vis; i >= 0 && i <= last_vis && i < g_disp_count; i++)
 		if (disp_wants_thumb(i))
 			return i;
-	for (int i = last_vis + 1; i <= last_vis + 2 * COLS && i < g_disp_count; i++)
+	for (int i = last_vis + 1; i <= last_vis + COLS && i < g_disp_count; i++)
 		if (i >= 0 && disp_wants_thumb(i))
 			return i;
-	for (int i = first_vis - 1; i >= first_vis - 2 * COLS && i >= 0; i--)
+	for (int i = first_vis - 1; i >= first_vis - COLS && i >= 0; i--)
 		if (disp_wants_thumb(i))
 			return i;
 	return -1;
@@ -1191,6 +1483,35 @@ static void draw_texture_fitted(vita2d_texture *tex, float x, float y,
 	float s = (box_w / w < box_h / h) ? box_w / w : box_h / h;
 	vita2d_draw_texture_scale(tex, x + (box_w - w * s) / 2.0f,
 				  y + (box_h - h * s) / 2.0f, s, s);
+}
+
+/* the largest pan offset (px) that keeps the scaled image covering the screen
+ * edge it's panned away from; 0 when the image is smaller than the screen */
+static float pan_limit(float scaled, float screen)
+{
+	float lim = (scaled - screen) / 2.0f;
+	return lim > 0.0f ? lim : 0.0f;
+}
+
+/* draw the detail image fit-to-screen, then scaled by `zoom` about the centre
+ * and shifted by (panx, pany). pan is clamped to keep the image on screen. */
+static void draw_texture_zoom(vita2d_texture *tex, float zoom,
+			      float *panx, float *pany)
+{
+	float w = vita2d_texture_get_width(tex);
+	float h = vita2d_texture_get_height(tex);
+	float fit = (SCREEN_W / w < SCREEN_H / h) ? SCREEN_W / w : SCREEN_H / h;
+	float s = fit * zoom;
+	float dw = w * s, dh = h * s;
+
+	float lx = pan_limit(dw, SCREEN_W), ly = pan_limit(dh, SCREEN_H);
+	if (*panx > lx) *panx = lx;
+	if (*panx < -lx) *panx = -lx;
+	if (*pany > ly) *pany = ly;
+	if (*pany < -ly) *pany = -ly;
+
+	vita2d_draw_texture_scale(tex, (SCREEN_W - dw) / 2.0f + *panx,
+				  (SCREEN_H - dh) / 2.0f + *pany, s, s);
 }
 
 static void draw_sel_outline(float x, float y, float w, float h)
@@ -1343,7 +1664,9 @@ static int download_video(int idx, char *err, size_t errlen)
 		curl_easy_setopt(curl, CURLOPT_RESOLVE, g_resolve_list);
 
 	g_dl_last_draw = 0;
+	net_lock(); /* TLS is single-threaded, see g_net_mutex */
 	CURLcode res = curl_easy_perform(curl);
+	net_unlock();
 	long code = 0;
 	if (res == CURLE_OK)
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -1896,7 +2219,7 @@ static void scan_dir(const char *path, int depth)
 
 	SceIoDirent ent;
 	memset(&ent, 0, sizeof(ent));
-	while (g_local_count < MAX_LOCAL && sceIoDread(dfd, &ent) > 0) {
+	while (sceIoDread(dfd, &ent) > 0) {
 		if (ent.d_name[0] == '.')
 			continue;
 
@@ -1930,6 +2253,11 @@ static void scan_dir(const char *path, int depth)
 			continue;
 		}
 
+		if (!grow_locals(g_local_count + 1)) {
+			log_line("scan: out of memory at %d local files",
+				 g_local_count);
+			break;
+		}
 		int j = g_local_count++;
 		memcpy(g_local_path[j], full, pl + 1 + nl + 1);
 		g_local_is_video[j] = is_video;
@@ -2121,7 +2449,9 @@ static void bulk_check_batch(const int *idxs, int n)
 	curl_easy_setopt(g_sync_curl, CURLOPT_POSTFIELDS, body);
 	curl_easy_setopt(g_sync_curl, CURLOPT_WRITEDATA, &buf);
 	curl_easy_setopt(g_sync_curl, CURLOPT_TIMEOUT, 60L);
+	net_lock(); /* TLS is single-threaded, see g_net_mutex */
 	CURLcode res = curl_easy_perform(g_sync_curl);
+	net_unlock();
 	long code = 0;
 	if (res == CURLE_OK)
 		curl_easy_getinfo(g_sync_curl, CURLINFO_RESPONSE_CODE, &code);
@@ -2208,7 +2538,9 @@ static int upload_item(int j, char *err, size_t errlen)
 	curl_easy_setopt(g_sync_curl, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(g_sync_curl, CURLOPT_XFERINFOFUNCTION, upload_xfer_cb);
 
+	net_lock(); /* TLS is single-threaded, see g_net_mutex */
 	CURLcode res = curl_easy_perform(g_sync_curl);
+	net_unlock();
 	long code = 0;
 	if (res == CURLE_OK)
 		curl_easy_getinfo(g_sync_curl, CURLINFO_RESPONSE_CODE, &code);
@@ -2433,6 +2765,34 @@ static int count_state(int st)
 	return n;
 }
 
+static const char *state_name(int st)
+{
+	switch (st) {
+	case SYNC_UNSCANNED: return "not scanned";
+	case SYNC_HASHING:   return "hashing";
+	case SYNC_CHECKING:  return "checking server";
+	case SYNC_LOCAL_ONLY:return "local only";
+	case SYNC_QUEUED:    return "queued";
+	case SYNC_UPLOADING: return "uploading";
+	case SYNC_BACKED_UP: return "backed up";
+	case SYNC_FAILED:    return "failed";
+	default:             return "?";
+	}
+}
+
+/* format a byte count as B / KB / MB / GB into `out` */
+static void human_size(long long bytes, char *out, size_t len)
+{
+	if (bytes >= 1024LL * 1024 * 1024)
+		snprintf(out, len, "%.1f GB", bytes / (1024.0 * 1024 * 1024));
+	else if (bytes >= 1024LL * 1024)
+		snprintf(out, len, "%.1f MB", bytes / (1024.0 * 1024));
+	else if (bytes >= 1024)
+		snprintf(out, len, "%.1f KB", bytes / 1024.0);
+	else
+		snprintf(out, len, "%lld B", bytes);
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
@@ -2445,11 +2805,39 @@ int main(void)
 	vita2d_set_clear_color(RGBA8(16, 16, 16, 255));
 	g_font = vita2d_load_default_pgf();
 
+	/* analog mode so the left stick reports lx/ly for detail-view panning */
+	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
+
 	/* start a fresh debug log each launch */
 	sceIoMkdir(CONFIG_DIR, 0777);
 	FILE *lf = fopen(LOG_PATH, "w");
 	if (lf)
 		fclose(lf);
+
+	/* Pre-grow the newlib heap while still single-threaded. vitasdk's
+	 * newlib maps heap memblocks on demand as sbrk grows; on Vita3K the
+	 * page-mapping done by one thread races other threads' JIT'd memory
+	 * accesses, so a heap growth during a thumbnail download or page
+	 * fetch intermittently faults on the freshly mapped pages (crash
+	 * locations wander: OpenSSL GCM, libjpeg, strlen). Touching a large
+	 * block now commits the arena up front, so the heap never grows once
+	 * the worker/sync threads exist. dlmalloc keeps the sbrk'd arena
+	 * after the free, which is also headroom AVPlayer's allocator needs
+	 * for video playback anyway. */
+	{
+		/* never trim: a trimmed top chunk would shrink sbrk and unmap
+		 * the pages again, reintroducing runtime heap growth */
+		mallopt(M_TRIM_THRESHOLD, 0x7fffffff);
+		size_t want = 96 * 1024 * 1024;
+		void *ball = NULL;
+		while (want >= 8 * 1024 * 1024 && !(ball = malloc(want)))
+			want /= 2;
+		if (ball) {
+			memset(ball, 0, want);
+			free(ball);
+		}
+		log_line("heap pre-grown: %u MB", (unsigned)(want >> 20));
+	}
 
 	show_status("Starting network...");
 	net_init();
@@ -2507,6 +2895,8 @@ int main(void)
 	int mode = MODE_GRID;
 	int sync_return_mode = MODE_GRID;
 	int sel = 0;
+	int grid_last_sel = -1;   /* sel at the previous frame */
+	int grid_settle = 0;      /* frames since sel last changed */
 	float scroll = 0.0f, target = 0.0f;
 	unsigned int prev_buttons = 0;
 	unsigned int held_frames = 0;
@@ -2515,6 +2905,7 @@ int main(void)
 	vita2d_texture *detail_tex = NULL;
 	int detail_idx = -1;
 	int detail_failed = 0;
+	float zoom = 1.0f, panx = 0.0f, pany = 0.0f;
 
 	for (;;) {
 		SceCtrlData pad;
@@ -2578,26 +2969,53 @@ int main(void)
 			if (sel >= g_disp_count)
 				sel = g_disp_count - 1;
 
-			if (pressed & SCE_CTRL_CROSS)
-				mode = MODE_DETAIL;
+			/* Track how long the selection has held still. A held
+			 * d-pad auto-repeats one row every few frames; while it's
+			 * moving we suspend the expensive/fragile work below:
+			 *  - thumbnail texture create/free (rapid GPU map+unmap
+			 *    churn fragments the address space until vita2d returns
+			 *    a partially-mapped texture and the draw faults), and
+			 *  - page fetching (otherwise a held key races sel to the
+			 *    end and fires fetch+rebuild every frame — a request
+			 *    storm that hammers the server and drives that churn).
+			 * Everything resumes once you stop. Auto-repeat period is
+			 * 5 frames, so a threshold of 12 covers it. */
+			if (sel != grid_last_sel) {
+				grid_last_sel = sel;
+				grid_settle = 0;
+			} else if (grid_settle < 1000) {
+				grid_settle++;
+			}
+			int scrolling_fast = (grid_settle < 12);
 
-			/* fetch the next page when selection nears the end */
-			if (g_next_page > 0 &&
+			if (pressed & SCE_CTRL_CROSS) {
+				mode = MODE_DETAIL;
+				zoom = 1.0f;
+				panx = pany = 0.0f;
+			}
+
+			/* fetch the next page when the selection settles near the
+			 * end (gated on !scrolling_fast, see above) */
+			if (!scrolling_fast && g_next_page > 0 &&
 			    sel >= g_disp_count - COLS * 4) {
 				show_status("Loading more photos... (%d so far)",
 					    g_asset_count);
 				if (fetch_page(0) > 0)
 					rebuild_display();
+				if (sel >= g_disp_count)
+					sel = g_disp_count - 1;
 			}
 
-			/* scroll follows the selection */
-			float sel_y = (float)(sel / COLS) * CELL_H;
-			if (sel_y < target)
-				target = sel_y;
+			/* scroll follows the selection, using the precomputed
+			 * per-item y so month headers shift it correctly. when
+			 * moving up, reveal the header band above the item. */
+			float sel_y = (sel >= 0 && sel < g_disp_count) ?
+				      g_item_y[sel] : 0.0f;
+			if (sel_y - HEADER_H < target)
+				target = sel_y - HEADER_H;
 			if (sel_y + CELL_H > target + SCREEN_H)
 				target = sel_y + CELL_H - SCREEN_H;
-			int rows = (g_disp_count + COLS - 1) / COLS;
-			float max_scroll = rows * CELL_H - SCREEN_H;
+			float max_scroll = g_content_h - SCREEN_H;
 			if (max_scroll < 0)
 				max_scroll = 0;
 			if (target < 0)
@@ -2606,36 +3024,43 @@ int main(void)
 				target = max_scroll;
 			scroll += (target - scroll) * 0.35f;
 
-			int first_vis = ((int)scroll / CELL_H) * COLS;
-			int last_vis = (((int)scroll + SCREEN_H) / CELL_H + 1) * COLS - 1;
-			if (last_vis >= g_disp_count)
-				last_vis = g_disp_count - 1;
+			/* visible index range (item y is non-decreasing with i),
+			 * computed in the same pass as thumb eviction below */
+			int first_vis = -1, last_vis = -1;
 
 			/* evict thumbs far outside the viewport (never the one
-			 * the worker is currently loading); wait for the GPU
-			 * before the first free in case a recently drawn
-			 * texture is still referenced by an in-flight frame */
-			int waited = 0;
+			 * the worker is currently loading); evicted textures
+			 * are recycled through the pool, see tex_release */
 			for (int i = 0; i < g_disp_count; i++) {
-				float dy = (float)(i / COLS) * CELL_H - scroll;
-				if (disp_thumb(i) &&
-				    (dy < -2.5f * SCREEN_H || dy > 3.5f * SCREEN_H)) {
+				float dy = g_item_y[i] - scroll;
+				if (dy > -CELL_H && dy < SCREEN_H) {
+					if (first_vis < 0)
+						first_vis = i;
+					last_vis = i;
+				}
+				/* free thumbs well outside the viewport (only when
+				 * not mid-scroll, see scrolling_fast above) */
+				if (!scrolling_fast && disp_thumb(i) &&
+				    (dy < -1.25f * SCREEN_H || dy > 1.75f * SCREEN_H)) {
 					struct disp_item *it = &g_disp[i];
 					/* don't free a thumb the worker is filling */
 					if (g_req_state != REQ_IDLE &&
 					    g_req_idx == it->idx &&
 					    g_req_src == it->src)
 						continue;
-					if (!waited) {
-						vita2d_wait_rendering_done();
-						waited = 1;
-					}
-					vita2d_free_texture(disp_thumb(i));
+					/* recycle, never free: the GPU side may
+					 * still touch a freed texture's memory */
+					tex_release(disp_thumb(i));
 					if (it->src == SRC_LOCAL)
 						g_local_thumb[it->idx] = NULL;
 					else
 						g_thumb[it->idx] = NULL;
 				}
+			}
+
+			if (first_vis < 0) { /* nothing matched (empty grid) */
+				first_vis = 0;
+				last_vis = g_disp_count - 1;
 			}
 
 			/* collect finished download, then hand the worker
@@ -2644,11 +3069,24 @@ int main(void)
 				__sync_synchronize();
 				consume_worker_result();
 			}
-			if (g_req_state == REQ_IDLE) {
+			if (g_req_state == REQ_IDLE && !scrolling_fast) {
 				int next = pick_next_load(sel, first_vis, last_vis);
 				if (next >= 0) {
-					g_req_idx = g_disp[next].idx;
-					g_req_src = g_disp[next].src;
+					struct disp_item *it = &g_disp[next];
+					g_req_idx = it->idx;
+					g_req_src = it->src;
+					/* copy the payload so the worker needn't
+					 * index arrays we may realloc */
+					if (it->src == SRC_LOCAL) {
+						snprintf(g_req_path, sizeof(g_req_path),
+							 "%s", g_local_path[it->idx]);
+						g_req_is_video =
+							g_local_is_video[it->idx];
+					} else {
+						snprintf(g_req_id, sizeof(g_req_id),
+							 "%s", g_asset_ids[it->idx]);
+						g_req_is_video = 0;
+					}
 					__sync_synchronize();
 					g_req_state = REQ_PENDING;
 				}
@@ -2657,9 +3095,22 @@ int main(void)
 			vita2d_start_drawing();
 			vita2d_clear_screen();
 
+			/* month/year header bands */
+			for (int h = 0; h < g_sect_count; h++) {
+				float hy = g_sect[h].y - scroll;
+				if (hy + HEADER_H < 0 || hy > SCREEN_H)
+					continue;
+				vita2d_pgf_draw_text(g_font, 10, hy + HEADER_H - 12,
+						     RGBA8(255, 255, 255, 255),
+						     1.1f, g_sect[h].label);
+				vita2d_draw_rectangle(10, hy + HEADER_H - 6,
+						      SCREEN_W - 20, 2,
+						      RGBA8(90, 90, 90, 255));
+			}
+
 			for (int i = first_vis; i >= 0 && i <= last_vis; i++) {
-				float x = (float)(i % COLS) * CELL_W;
-				float y = (float)(i / COLS) * CELL_H - scroll;
+				float x = g_item_x[i];
+				float y = g_item_y[i] - scroll;
 				float bx = x + CELL_PAD, by = y + CELL_PAD;
 				float bw = CELL_W - 2 * CELL_PAD;
 				float bh = CELL_H - 2 * CELL_PAD;
@@ -2702,10 +3153,39 @@ int main(void)
 			int is_local = (it.src == SRC_LOCAL);
 			int is_video = disp_is_video(sel);
 
-			if (nav & SCE_CTRL_RIGHT && sel < g_disp_count - 1)
-				sel++;
-			if (nav & SCE_CTRL_LEFT && sel > 0)
-				sel--;
+			/* zoom with the triggers (continuous while held) */
+			if (!is_video && detail_tex) {
+				if (pad.buttons & SCE_CTRL_RTRIGGER)
+					zoom *= 1.04f;
+				if (pad.buttons & SCE_CTRL_LTRIGGER)
+					zoom /= 1.04f;
+				if (zoom > 8.0f)
+					zoom = 8.0f;
+				if (zoom < 1.0f) {
+					zoom = 1.0f;
+					panx = pany = 0.0f;
+				}
+			}
+			int zoomed = (zoom > 1.001f);
+
+			if (zoomed) {
+				/* pan with the left stick + d-pad; don't browse */
+				float dx = (pad.lx - 128) / 128.0f;
+				float dy = (pad.ly - 128) / 128.0f;
+				if (dx > 0.15f || dx < -0.15f)
+					panx -= dx * 16.0f;
+				if (dy > 0.15f || dy < -0.15f)
+					pany -= dy * 16.0f;
+				if (pad.buttons & SCE_CTRL_RIGHT) panx -= 12.0f;
+				if (pad.buttons & SCE_CTRL_LEFT)  panx += 12.0f;
+				if (pad.buttons & SCE_CTRL_UP)    pany += 12.0f;
+				if (pad.buttons & SCE_CTRL_DOWN)  pany -= 12.0f;
+			} else {
+				if (nav & SCE_CTRL_RIGHT && sel < g_disp_count - 1)
+					sel++;
+				if (nav & SCE_CTRL_LEFT && sel > 0)
+					sel--;
+			}
 			if (pressed & SCE_CTRL_CIRCLE) {
 				mode = MODE_GRID;
 				continue;
@@ -2738,6 +3218,8 @@ int main(void)
 			is_video = disp_is_video(sel);
 
 			if (detail_idx != sel) {
+				zoom = 1.0f; /* reset view for the new photo */
+				panx = pany = 0.0f;
 				if (detail_tex) {
 					/* the GPU may still be drawing the
 					 * previous frame with this texture */
@@ -2771,8 +3253,7 @@ int main(void)
 			vita2d_clear_screen();
 
 			if (detail_tex)
-				draw_texture_fitted(detail_tex, 0, 0,
-						    SCREEN_W, SCREEN_H);
+				draw_texture_zoom(detail_tex, zoom, &panx, &pany);
 			else if (is_video)
 				draw_centered(SCREEN_H / 2,
 					      RGBA8(200, 200, 200, 255),
@@ -2786,11 +3267,16 @@ int main(void)
 
 			const char *xhint = detail_failed ? "X retry    " :
 					    is_video ? "X play    " : "";
-			char hud[160];
-			snprintf(hud, sizeof(hud),
-				 "%d / %d    %.19s    < > browse    %sO back    START exit",
-				 sel + 1, g_disp_count,
-				 g_disp_count > 0 ? disp_date(sel) : "", xhint);
+			char hud[200];
+			if (zoom > 1.001f)
+				snprintf(hud, sizeof(hud),
+					 "%d / %d    %.0f%%    stick/d-pad pan    L/R zoom    O back",
+					 sel + 1, g_disp_count, zoom * 100.0f);
+			else
+				snprintf(hud, sizeof(hud),
+					 "%d / %d    %.19s    < > browse  L/R zoom  %sO back",
+					 sel + 1, g_disp_count,
+					 g_disp_count > 0 ? disp_date(sel) : "", xhint);
 			draw_hud(hud);
 
 			vita2d_end_drawing();
@@ -2816,27 +3302,87 @@ int main(void)
 				      count_state(SYNC_HASHING) +
 				      count_state(SYNC_CHECKING);
 
+			/* photo/video split + total and backed-up byte totals */
+			int srv_vid = 0;
+			for (int i = 0; i < g_asset_count; i++)
+				srv_vid += g_asset_is_video[i] ? 1 : 0;
+			int loc_vid = 0;
+			long long loc_bytes = 0, backed_bytes = 0;
+			for (int j = 0; j < g_local_count; j++) {
+				loc_vid += g_local_is_video[j] ? 1 : 0;
+				loc_bytes += g_local_size[j];
+				if (g_local_state[j] == SYNC_BACKED_UP)
+					backed_bytes += g_local_size[j];
+			}
+			int loc_pct = g_local_count ? (backed * 100 / g_local_count) : 0;
+
 			vita2d_start_drawing();
 			vita2d_clear_screen();
 
 			draw_centered(40, RGBA8(255, 255, 255, 255), "Sync overview");
 
-			char line[200];
-			int y = 96;
+			char line[200], sz1[24], sz2[24];
+			int y = 84;
 			uint32_t c = RGBA8(220, 220, 220, 255);
-			snprintf(line, sizeof(line), "Server assets fetched: %d%s",
-				 g_asset_count, g_next_page > 0 ? " (more)" : "");
-			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 34;
-			snprintf(line, sizeof(line), "Local camera files:    %d",
-				 g_local_count);
-			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 34;
+			snprintf(line, sizeof(line),
+				 "Server assets: %d%s  (%d photos, %d videos)",
+				 g_asset_count, g_next_page > 0 ? "+" : "",
+				 g_asset_count - srv_vid, srv_vid);
+			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 30;
+			human_size(loc_bytes, sz1, sizeof(sz1));
+			snprintf(line, sizeof(line),
+				 "Local files:   %d  (%d photos, %d videos)  %s",
+				 g_local_count, g_local_count - loc_vid, loc_vid, sz1);
+			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 30;
 			snprintf(line, sizeof(line),
 				 "backed up %d   local-only %d   queued/uploading %d",
 				 backed, local_only, queued);
-			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 34;
+			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 30;
 			snprintf(line, sizeof(line), "scanning/hashing %d   failed %d",
 				 pending, failed);
-			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 40;
+			vita2d_pgf_draw_text(g_font, 60, y, c, 1.0f, line); y += 30;
+			human_size(backed_bytes, sz1, sizeof(sz1));
+			human_size(loc_bytes, sz2, sizeof(sz2));
+			snprintf(line, sizeof(line),
+				 "Backed up: %d%% of local  (%s / %s)",
+				 loc_pct, sz1, sz2);
+			vita2d_pgf_draw_text(g_font, 60, y,
+					     RGBA8(120, 200, 120, 255), 1.0f, line);
+			y += 38;
+
+			/* details of the item currently selected in the grid */
+			if (g_disp_count > 0 && sel >= 0 && sel < g_disp_count) {
+				struct disp_item *si = &g_disp[sel];
+				const char *name;
+				if (si->src == SRC_LOCAL) {
+					const char *p = g_local_path[si->idx];
+					const char *slash = strrchr(p, '/');
+					name = slash ? slash + 1 : p;
+				} else {
+					name = g_asset_ids[si->idx];
+				}
+				snprintf(line, sizeof(line), "Selected: %.40s", name);
+				vita2d_pgf_draw_text(g_font, 60, y, c, 0.95f, line);
+				y += 26;
+				if (si->src == SRC_LOCAL) {
+					human_size(g_local_size[si->idx], sz1,
+						   sizeof(sz1));
+					snprintf(line, sizeof(line),
+						 "  %.19s   %s   %s%s",
+						 g_local_date[si->idx], sz1,
+						 g_local_is_video[si->idx] ?
+							 "video, " : "photo, ",
+						 state_name(g_local_state[si->idx]));
+				} else {
+					snprintf(line, sizeof(line),
+						 "  %.19s   %s   on server",
+						 g_asset_dates[si->idx],
+						 g_asset_is_video[si->idx] ?
+							 "video" : "photo");
+				}
+				vita2d_pgf_draw_text(g_font, 60, y, c, 0.95f, line);
+			}
+			y += 36;
 
 			/* current activity + upload progress */
 			if (g_sync_activity[0]) {
@@ -2874,9 +3420,21 @@ int main(void)
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
 		}
+
+		/* Pace the loop to the display (~60 Hz). vita2d's swap doesn't
+		 * block on vblank, so without this the loop free-runs at
+		 * whatever speed the host allows — which makes the auto-repeat
+		 * race the selection forward absurdly fast, fires a page-fetch
+		 * storm, and churns thumbnail textures hard enough to fault the
+		 * GPU. Pacing it also makes the frame-count throttling above
+		 * behave the same here as on real hardware. */
+		sceDisplayWaitVblankStart();
 	}
 
 	vita2d_wait_rendering_done();
+	for (int i = 0; i < g_texpool_n; i++) /* drain the recycle pool */
+		vita2d_free_texture(g_texpool[i]);
+	g_texpool_n = 0;
 	if (detail_tex)
 		vita2d_free_texture(detail_tex);
 	for (int i = 0; i < g_asset_count; i++)
