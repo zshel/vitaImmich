@@ -1,6 +1,13 @@
 # CLAUDE.md — vitaImmich
 
-PS Vita Immich client (PoC). C sources in `src/` (`main.c`, vendored `jsmn.h`).
+PS Vita Immich client (PoC). C sources in `src/`. It's a **unity build**:
+`main.c` holds the includes, `#define`s and core globals, then `#include`s the
+section files (`state.c`, `draw.c`, `config.c`, `net.c`, `jpeg.c`, `api.c`,
+`thumbs.c`, `display.c`, `ui.c`, `video.c`, `sync.c`, `app.c`) in order. They
+form **one translation unit** and share all file-scope state — there are no
+headers or `extern` decls. **Only `src/main.c` is compiled** (CMakeLists lists
+just it); the parts are textual slices, so add new code to the relevant part,
+not to CMake. `jsmn.h` is vendored.
 Built with the VitaSDK toolchain into a `.vpk`, run in the **Vita3K** emulator,
 and driven headlessly through the **kwin-mcp** server. This file is the
 end-to-end loop: **build → install → launch → drive → read logs.** For the
