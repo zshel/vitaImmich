@@ -70,6 +70,7 @@
 #define CONFIG_DIR  "ux0:data/vitaimmich"
 #define CONFIG_PATH CONFIG_DIR "/config.txt"
 #define LOG_PATH    CONFIG_DIR "/log.txt"
+#define AUTOBK_PATH CONFIG_DIR "/autobackup.txt"
 #define VIDEO_TMP_PATH CONFIG_DIR "/video.mp4"
 
 /* give curl/jpeg decoding plenty of heap */
@@ -80,6 +81,10 @@ static char g_apikey[256];
 static char g_serverip[64];
 /* optional DNS pin ("host:port:ip") for routers without NAT loopback */
 static struct curl_slist *g_resolve_list;
+
+/* auto-backup: when set, newly-found local-only photos are queued for upload
+ * automatically (toggled on the cloud page, persisted to AUTOBK_PATH) */
+static int g_autobackup;
 
 /* folders scanned for camera media (config syncdir=, with defaults), and
  * a size cap so a movie collection in ux0:video isn't hashed/synced */
@@ -3617,6 +3622,26 @@ static int queue_all_uploads(void)
 	return n;
 }
 
+static void load_autobackup(void)
+{
+	FILE *f = fopen(AUTOBK_PATH, "r");
+	if (!f)
+		return;
+	int v = 0;
+	if (fscanf(f, "%d", &v) == 1)
+		g_autobackup = (v != 0);
+	fclose(f);
+}
+
+static void save_autobackup(void)
+{
+	FILE *f = fopen(AUTOBK_PATH, "w");
+	if (f) {
+		fputc(g_autobackup ? '1' : '0', f);
+		fclose(f);
+	}
+}
+
 
 /* ------------------------------------------------------------------ */
 /* grid status badges + sync overview                                  */
@@ -3795,6 +3820,8 @@ int main(void)
 	if (syncw >= 0)
 		sceKernelStartThread(syncw, 0, NULL);
 
+	load_autobackup();
+
 	int mode = MODE_GRID;
 	int sel = 0;
 	int cloud_scroll = 0;   /* first visible row on the upload-details list */
@@ -3847,6 +3874,13 @@ int main(void)
 		if (pad.buttons & SCE_CTRL_START)
 			break;
 		frame++;
+
+		/* auto-backup: while enabled, queue any newly-found local-only
+		 * photos for upload (~1/s; the sync thread drains the queue).
+		 * this covers both launch and photos found mid-session. */
+		if (g_autobackup && frame % 60 == 0 &&
+		    count_state(SYNC_LOCAL_ONLY) > 0)
+			queue_all_uploads();
 
 		/* the sync thread asks us (the only writer of g_disp) to rebuild
 		 * the merged timeline after a status change; keep the selection
@@ -4753,12 +4787,15 @@ pf_skip:
 			int backed = count_state(SYNC_BACKED_UP);
 			int remain = total - backed;
 
-			/* on-screen action buttons (also X = details, /\ = upload) */
-			float bth = 46, bty = 404;
+			/* auto-upload toggle switch + on-screen action buttons
+			 * (also [] = toggle, X = details, /\ = upload) */
+			float tgw = 60, tgh = 30, tgx = 470, tgy = 350;
+			float bth = 46, bty = 408;
 			float dbx = 60, dbw = 360;             /* See details */
 			float ubx = dbx + dbw + 20, ubw = 320; /* Upload all   */
 			int go_details = (pressed & SCE_CTRL_CROSS) != 0;
 			int do_upload = (pressed & SCE_CTRL_TRIANGLE) != 0;
+			int do_toggle = (pressed & SCE_CTRL_SQUARE) != 0;
 
 			if (pressed & SCE_CTRL_CIRCLE) {
 				mode = MODE_GRID;
@@ -4785,8 +4822,14 @@ pf_skip:
 					touch_y = ty;
 				} else if (touch_active) {
 					touch_active = 0;
-					if (!touch_dragged && touch_y >= bty &&
-					    touch_y <= bty + bth) {
+					if (touch_dragged) {
+						/* ignore drags */
+					} else if (touch_y >= tgy - 6 &&
+						   touch_y <= tgy + tgh + 6 &&
+						   touch_x >= 60 && touch_x <= tgx + tgw) {
+						do_toggle = 1;
+					} else if (touch_y >= bty &&
+						   touch_y <= bty + bth) {
 						if (touch_x >= dbx &&
 						    touch_x <= dbx + dbw)
 							go_details = 1;
@@ -4797,6 +4840,14 @@ pf_skip:
 				}
 			}
 
+			if (do_toggle) {
+				g_autobackup = !g_autobackup;
+				save_autobackup();
+				if (g_autobackup)
+					queue_all_uploads();
+				log_line("cloud: auto-upload %s",
+					 g_autobackup ? "on" : "off");
+			}
 			if (do_upload) {
 				int q = queue_all_uploads();
 				log_line("cloud: queued %d uploads", q);
@@ -4858,6 +4909,24 @@ pf_skip:
 			snprintf(line, sizeof(line), "  Remaining: %d", remain);
 			draw_text(60, y, RGBA8(220, 180, 120, 255), 1.0f, line);
 
+			/* auto-upload toggle switch */
+			draw_text(60, tgy + 21, c, 1.0f, "Auto-upload new photos");
+			vita2d_texture *tg = rounded_mask_tex((int)tgw, (int)tgh,
+							      tgh / 2.0f);
+			uint32_t trk = g_autobackup ? RGBA8(90, 180, 110, 255)
+						    : RGBA8(70, 70, 76, 255);
+			if (tg)
+				vita2d_draw_texture_tint(tg, tgx, tgy, trk);
+			else
+				vita2d_draw_rectangle(tgx, tgy, tgw, tgh, trk);
+			float kx = g_autobackup ? tgx + tgw - tgh / 2.0f
+						: tgx + tgh / 2.0f;
+			vita2d_draw_fill_circle(kx, tgy + tgh / 2.0f, tgh / 2.0f - 3.0f,
+						RGBA8(245, 245, 250, 255));
+			draw_text(tgx + tgw + 14, tgy + 21,
+				  g_autobackup ? RGBA8(120, 200, 120, 255) : dim,
+				  0.95f, g_autobackup ? "ON" : "OFF");
+
 			/* See details + Upload all buttons */
 			vita2d_texture *db = rounded_mask_tex((int)dbw, (int)bth, 10.0f);
 			if (db)
@@ -4882,7 +4951,7 @@ pf_skip:
 			draw_text(ubx + 18, bty + bth - 16,
 				  RGBA8(245, 245, 250, 255), 0.95f, "Upload all");
 
-			draw_hud("X / tap details    /\\ / tap upload all    O back    START exit");
+			draw_hud("[] auto-upload   X details   /\\ upload all   O back   START exit");
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
 		} else if (mode == MODE_CLOUD_DETAILS) {
