@@ -65,6 +65,7 @@
 
 #define PAGE_SIZE  100
 #define DATELEN    20            /* "YYYY-MM-DDTHH:MM:SS" + NUL, sortable */
+#define APP_VERSION "1.0"        /* keep in step with CMakeLists VITA_VERSION */
 
 #define CONFIG_DIR  "ux0:data/vitaimmich"
 #define CONFIG_PATH CONFIG_DIR "/config.txt"
@@ -188,6 +189,14 @@ static char g_search_query[128];
 static int *g_search_idx;
 static int g_search_count;
 static int g_search_cap;
+
+/* server info shown on the cloud/backup page; fetched lazily the first time
+ * the page is opened. g_srv_state: 0 not fetched, 1 ok, -1 failed. */
+static int g_srv_state;
+static char g_srv_use[40];      /* disk used, human ("1.4 TiB") */
+static char g_srv_total[40];    /* disk size, human ("1.8 TiB") */
+static int g_srv_pct;           /* disk usage percentage */
+static char g_srv_version[40];  /* "v1.119.0" */
 
 /* Texture recycling pool. Freeing a texture unmaps its memblock, and the
  * GPU side (notably Vita3K's texture cache, which re-reads guest memory of
@@ -722,6 +731,95 @@ static CURLcode http_request(const char *url, const char *body,
 	curl_slist_free_all(hdrs);
 	curl_easy_cleanup(curl);
 	return res;
+}
+
+/* copy the value of a top-level JSON key into `out` (raw token text, works
+ * for both string and number values). returns 1 if found. small flat
+ * responses only (server storage / version). */
+static int json_get(const char *js, size_t len, const char *key,
+		    char *out, size_t outlen)
+{
+	jsmn_parser p;
+	jsmn_init(&p);
+	int n = jsmn_parse(&p, js, len, NULL, 0);
+	if (n <= 0)
+		return 0;
+	jsmntok_t *t = malloc(sizeof(*t) * n);
+	if (!t)
+		return 0;
+	jsmn_init(&p);
+	n = jsmn_parse(&p, js, len, t, n);
+	int kl = (int)strlen(key), got = 0;
+	for (int i = 1; i + 1 < n; i++) {
+		if (t[i].type == JSMN_STRING && t[i].parent == 0 &&
+		    t[i].end - t[i].start == kl &&
+		    !strncmp(js + t[i].start, key, kl)) {
+			int vl = t[i + 1].end - t[i + 1].start;
+			if (vl >= (int)outlen)
+				vl = (int)outlen - 1;
+			memcpy(out, js + t[i + 1].start, vl);
+			out[vl] = '\0';
+			got = 1;
+			break;
+		}
+	}
+	free(t);
+	return got;
+}
+
+/* GET a JSON endpoint, trying the modern path then a legacy fallback. fills
+ * `out`/`code`; caller frees out->data. returns CURLcode of the call used. */
+static CURLcode server_get(const char *path, const char *legacy,
+			   membuf *out, long *code)
+{
+	char url[600];
+	snprintf(url, sizeof(url), "%s%s", g_server, path);
+	CURLcode r = http_request(url, NULL, out, code, NULL, 0);
+	if (r == CURLE_OK && (*code < 200 || *code >= 300) && legacy) {
+		free(out->data);
+		snprintf(url, sizeof(url), "%s%s", g_server, legacy);
+		r = http_request(url, NULL, out, code, NULL, 0);
+	}
+	return r;
+}
+
+/* fetch disk usage + server version into the g_srv_* fields (main thread) */
+static void fetch_server_info(void)
+{
+	membuf buf;
+	long code;
+
+	CURLcode r = server_get("/api/server/storage",
+				"/api/server-info/storage", &buf, &code);
+	if (r == CURLE_OK && code >= 200 && code < 300 && buf.data) {
+		char pct[24] = "";
+		if (!json_get(buf.data, buf.size, "diskUse",
+			      g_srv_use, sizeof(g_srv_use)))
+			g_srv_use[0] = '\0';
+		if (!json_get(buf.data, buf.size, "diskSize",
+			      g_srv_total, sizeof(g_srv_total)))
+			g_srv_total[0] = '\0';
+		if (json_get(buf.data, buf.size, "diskUsagePercentage",
+			     pct, sizeof(pct)))
+			g_srv_pct = (int)(atof(pct) + 0.5);
+		g_srv_state = 1;
+	} else {
+		log_line("server storage: curl %d http %ld", r, code);
+		g_srv_state = -1;
+	}
+	free(buf.data);
+
+	r = server_get("/api/server/version", "/api/server-info/version",
+		       &buf, &code);
+	if (r == CURLE_OK && code >= 200 && code < 300 && buf.data) {
+		char mj[12] = "", mn[12] = "", pt[12] = "";
+		json_get(buf.data, buf.size, "major", mj, sizeof(mj));
+		json_get(buf.data, buf.size, "minor", mn, sizeof(mn));
+		json_get(buf.data, buf.size, "patch", pt, sizeof(pt));
+		snprintf(g_srv_version, sizeof(g_srv_version), "v%s.%s.%s",
+			 mj[0] ? mj : "?", mn[0] ? mn : "?", pt[0] ? pt : "?");
+	}
+	free(buf.data);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1854,16 +1952,16 @@ static void draw_sel_outline(float x, float y, float w, float h)
  * texture's bilinear sampling are what soften the corners. */
 static vita2d_texture *rounded_mask_tex(int w, int h, float r)
 {
-	static vita2d_texture *cache;
-	static int cw, ch;
-	static float cr;
-	if (cache && cw == w && ch == h && cr == r)
-		return cache;
-	if (cache) {
-		vita2d_wait_rendering_done();
-		vita2d_free_texture(cache);
-		cache = NULL;
-	}
+	enum { NSLOT = 6 };  /* a small fixed set of shapes (pill, buttons, ...) */
+	static vita2d_texture *cache[NSLOT];
+	static int cw[NSLOT], ch[NSLOT];
+	static float cr[NSLOT];
+	static int n;
+	for (int i = 0; i < n; i++)
+		if (cw[i] == w && ch[i] == h && cr[i] == r)
+			return cache[i];
+	if (n >= NSLOT)
+		return NULL;
 	vita2d_texture *t = vita2d_create_empty_texture_format(w, h,
 		SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
 	if (!t)
@@ -1892,27 +1990,85 @@ static vita2d_texture *rounded_mask_tex(int w, int h, float r)
 						     hits * 255 / 16);
 		}
 	}
-	cache = t;
-	cw = w;
-	ch = h;
-	cr = r;
-	return cache;
+	cache[n] = t;
+	cw[n] = w;
+	ch[n] = h;
+	cr[n] = r;
+	n++;
+	return t;
 }
 
-/* a line-art magnifying glass baked into an AA white mask (4x4 supersampled):
- * a thin ring outline plus a straight, round-capped handle off the lower
- * right. drawn tinted to the icon colour. cached at one size. */
-static vita2d_texture *search_icon_tex(int s)
+/* ---- AA glyph icons (magnifier / map pin / cloud) -------------------- */
+/* each is a coverage predicate over icon-local pixel coords (0..s); bake_icon
+ * supersamples it 4x4 into a white alpha mask, drawn tinted to the wanted
+ * colour. one cached texture per icon (called at a fixed size each frame). */
+
+static float seg_dist(float px, float py, float ax, float ay,
+		      float bx, float by)
 {
-	static vita2d_texture *cache;
-	static int cs;
-	if (cache && cs == s)
-		return cache;
-	if (cache) {
-		vita2d_wait_rendering_done();
-		vita2d_free_texture(cache);
-		cache = NULL;
-	}
+	float dx = bx - ax, dy = by - ay;
+	float l2 = dx * dx + dy * dy;
+	float t = l2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+	if (t < 0) t = 0;
+	if (t > 1) t = 1;
+	float qx = ax + dx * t, qy = ay + dy * t;
+	return sqrtf((px - qx) * (px - qx) + (py - qy) * (py - qy));
+}
+
+static int in_tri(float px, float py, float ax, float ay, float bx, float by,
+		  float cx, float cy)
+{
+	float d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+	float d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+	float d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+	int neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+	int pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+	return !(neg && pos);
+}
+
+/* a thin ring outline with a straight, round-capped handle off the lower right */
+static int cov_search(float px, float py, int s)
+{
+	float R = s * 0.30f, W = s * 0.11f;
+	if (W < 1.8f) W = 1.8f;
+	float ccx = s * 0.40f, ccy = s * 0.40f, hw = W * 0.5f, c45 = 0.70710678f;
+	float dr = sqrtf((px - ccx) * (px - ccx) + (py - ccy) * (py - ccy));
+	int ring = (dr <= R && dr >= R - W);
+	float ax = ccx + c45 * (R - hw), ay = ccy + c45 * (R - hw);
+	float bx = ccx + c45 * (R + s * 0.42f), by = ccy + c45 * (R + s * 0.42f);
+	return ring || seg_dist(px, py, ax, ay, bx, by) <= hw;
+}
+
+/* a filled map marker: a round head (with a hole) tapering to a point */
+static int cov_map(float px, float py, int s)
+{
+	float cx = s * 0.5f, hcy = s * 0.40f, Rp = s * 0.30f, tipY = s * 0.95f;
+	float dHead = sqrtf((px - cx) * (px - cx) + (py - hcy) * (py - hcy));
+	int solid = (dHead <= Rp) ||
+		    in_tri(px, py, cx - Rp * 0.78f, hcy + Rp * 0.30f,
+			   cx + Rp * 0.78f, hcy + Rp * 0.30f, cx, tipY);
+	return solid && dHead >= Rp * 0.42f;   /* punch the hole */
+}
+
+/* a filled cloud: three lobes tangent to a flat bottom (rounded sides), with
+ * a small body rectangle filling between the side lobes. all kept well inside
+ * the icon bounds so nothing clips at the edge. */
+static int cov_cloud(float px, float py, int s)
+{
+	float yb = s * 0.68f;   /* flat bottom */
+	int mid = sqrtf((px - s * 0.50f) * (px - s * 0.50f) +
+			(py - s * 0.42f) * (py - s * 0.42f)) <= s * 0.22f;
+	int lp = sqrtf((px - s * 0.34f) * (px - s * 0.34f) +
+		       (py - s * 0.52f) * (py - s * 0.52f)) <= s * 0.16f;
+	int rp = sqrtf((px - s * 0.66f) * (px - s * 0.66f) +
+		       (py - s * 0.52f) * (py - s * 0.52f)) <= s * 0.16f;
+	int base = (px >= s * 0.34f && px <= s * 0.66f &&
+		    py >= s * 0.52f && py <= yb);
+	return mid || lp || rp || base;
+}
+
+static vita2d_texture *bake_icon(int s, int (*inside)(float, float, int))
+{
 	vita2d_texture *t = vita2d_create_empty_texture_format(s, s,
 		SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
 	if (!t)
@@ -1920,49 +2076,42 @@ static vita2d_texture *search_icon_tex(int s)
 	uint32_t *data = vita2d_texture_get_datap(t);
 	int stride = (int)(vita2d_texture_get_stride(t) / 4);
 	memset(data, 0, (size_t)stride * s * 4);
-
-	float R = s * 0.30f;          /* ring outer radius */
-	float W = s * 0.11f;          /* stroke width */
-	if (W < 1.8f) W = 1.8f;
-	float ccx = s * 0.40f, ccy = s * 0.40f;   /* ring centre */
-	float hw = W * 0.5f;
-	float c45 = 0.70710678f;
-	/* handle segment, 45 deg toward the lower-right corner */
-	float ax = ccx + c45 * (R - hw), ay = ccy + c45 * (R - hw);
-	float bx = ccx + c45 * (R + s * 0.42f), by = ccy + c45 * (R + s * 0.42f);
-	float seg2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
-
-	for (int y = 0; y < s; y++) {
+	for (int y = 0; y < s; y++)
 		for (int x = 0; x < s; x++) {
 			int hits = 0;
 			for (int sy = 0; sy < 4; sy++)
-				for (int sx = 0; sx < 4; sx++) {
-					float px = x + (sx + 0.5f) / 4.0f;
-					float py = y + (sy + 0.5f) / 4.0f;
-					float dr = sqrtf((px - ccx) * (px - ccx) +
-							 (py - ccy) * (py - ccy));
-					int in = (dr <= R && dr >= R - W);
-					/* distance to the handle segment */
-					float tt = seg2 > 0 ?
-						((px - ax) * (bx - ax) +
-						 (py - ay) * (by - ay)) / seg2 : 0;
-					if (tt < 0) tt = 0;
-					if (tt > 1) tt = 1;
-					float hxp = ax + (bx - ax) * tt;
-					float hyp = ay + (by - ay) * tt;
-					float dh = sqrtf((px - hxp) * (px - hxp) +
-							 (py - hyp) * (py - hyp));
-					if (in || dh <= hw)
-						hits++;
-				}
+				for (int sx = 0; sx < 4; sx++)
+					hits += inside(x + (sx + 0.5f) / 4.0f,
+						       y + (sy + 0.5f) / 4.0f, s);
 			data[y * stride + x] = RGBA8(255, 255, 255,
 						     hits * 255 / 16);
 		}
-	}
-	cache = t;
-	cs = s;
-	return cache;
+	return t;
 }
+
+/* cache one texture per glyph; all are drawn at a fixed size each frame */
+static vita2d_texture *icon_tex(int which, int s)
+{
+	static vita2d_texture *cache[3];
+	static int cs[3];
+	if (which < 0 || which > 2)
+		return NULL;
+	if (cache[which] && cs[which] == s)
+		return cache[which];
+	if (cache[which]) {
+		vita2d_wait_rendering_done();
+		vita2d_free_texture(cache[which]);
+		cache[which] = NULL;
+	}
+	int (*fn)(float, float, int) = which == 0 ? cov_search :
+				       which == 1 ? cov_map : cov_cloud;
+	cache[which] = bake_icon(s, fn);
+	cs[which] = s;
+	return cache[which];
+}
+#define ICON_SEARCH 0
+#define ICON_MAP    1
+#define ICON_CLOUD  2
 
 /* small clear (x) chip used on the right of the bar while a search is on */
 static void draw_clear_x(float cx, float cy, float s, unsigned int col)
@@ -1973,13 +2122,33 @@ static void draw_clear_x(float cx, float cy, float s, unsigned int col)
 	}
 }
 
-/* pixel geometry of the search pill, shared by the drawer and the tap test */
+/* pixel geometry of the search pill + the two buttons on its right, shared
+ * by the drawer and the tap test */
 #define BAR_M  12.0f                       /* left/right margin */
 #define BAR_Y  8.0f                        /* top of the pill */
 #define BAR_H  40.0f                       /* pill height */
 #define BAR_R  12.0f                       /* corner radius */
-#define BAR_W  ((float)SCREEN_W - 2 * BAR_M)
+#define BTN_SZ 40.0f                       /* button (rounded square) size */
+#define BTN_GAP 10.0f                      /* gap between the two buttons */
+#define BTN2_CX ((float)SCREEN_W - BAR_M - BTN_SZ / 2)   /* cloud (rightmost) */
+#define BTN1_CX (BTN2_CX - BTN_SZ - BTN_GAP)             /* map */
+#define BTN_CY  (BAR_Y + BAR_H / 2)
+#define BAR_W  (BTN1_CX - BTN_SZ / 2 - BTN_GAP - BAR_M)  /* pill width */
 #define BAR_CLEAR_CX (BAR_M + BAR_W - 22.0f) /* centre of the clear chip */
+
+/* one future-feature button: rounded-square background + a centred AA glyph */
+static void draw_bar_button(float cx, int icon)
+{
+	vita2d_texture *bg = rounded_mask_tex((int)BTN_SZ, (int)BTN_SZ, 11.0f);
+	if (bg)
+		vita2d_draw_texture_tint(bg, cx - BTN_SZ / 2, BTN_CY - BTN_SZ / 2,
+					 RGBA8(46, 46, 52, 255));
+	int isz = 26;
+	vita2d_texture *g = icon_tex(icon, isz);
+	if (g)
+		vita2d_draw_texture_tint(g, cx - isz / 2.0f, BTN_CY - isz / 2.0f,
+					 RGBA8(190, 190, 196, 255));
+}
 
 static void draw_search_bar(void)
 {
@@ -1994,11 +2163,15 @@ static void draw_search_bar(void)
 		vita2d_draw_rectangle(BAR_M, BAR_Y, BAR_W, BAR_H, field);
 
 	int isz = 24;
-	vita2d_texture *icon = search_icon_tex(isz);
+	vita2d_texture *icon = icon_tex(ICON_SEARCH, isz);
 	if (icon)
 		vita2d_draw_texture_tint(icon, BAR_M + 22 - isz / 2.0f,
 					 BAR_Y + BAR_H / 2 - isz / 2.0f,
 					 RGBA8(190, 190, 196, 255));
+
+	/* placeholder buttons (map, cloud) for future features */
+	draw_bar_button(BTN1_CX, ICON_MAP);
+	draw_bar_button(BTN2_CX, ICON_CLOUD);
 
 	float tx = BAR_M + 44, ty = BAR_Y + BAR_H - 13;
 	if (g_search_active && g_search_query[0]) {
@@ -3510,39 +3683,11 @@ static int count_state(int st)
 	return n;
 }
 
-static const char *state_name(int st)
-{
-	switch (st) {
-	case SYNC_UNSCANNED: return "not scanned";
-	case SYNC_HASHING:   return "hashing";
-	case SYNC_CHECKING:  return "checking server";
-	case SYNC_LOCAL_ONLY:return "local only";
-	case SYNC_QUEUED:    return "queued";
-	case SYNC_UPLOADING: return "uploading";
-	case SYNC_BACKED_UP: return "backed up";
-	case SYNC_FAILED:    return "failed";
-	default:             return "?";
-	}
-}
-
-/* format a byte count as B / KB / MB / GB into `out` */
-static void human_size(long long bytes, char *out, size_t len)
-{
-	if (bytes >= 1024LL * 1024 * 1024)
-		snprintf(out, len, "%.1f GB", bytes / (1024.0 * 1024 * 1024));
-	else if (bytes >= 1024LL * 1024)
-		snprintf(out, len, "%.1f MB", bytes / (1024.0 * 1024));
-	else if (bytes >= 1024)
-		snprintf(out, len, "%.1f KB", bytes / 1024.0);
-	else
-		snprintf(out, len, "%lld B", bytes);
-}
-
 /* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
-enum { MODE_GRID, MODE_DETAIL, MODE_SYNC };
+enum { MODE_GRID, MODE_DETAIL, MODE_CLOUD, MODE_CLOUD_DETAILS };
 
 int main(void)
 {
@@ -3651,8 +3796,8 @@ int main(void)
 		sceKernelStartThread(syncw, 0, NULL);
 
 	int mode = MODE_GRID;
-	int sync_return_mode = MODE_GRID;
 	int sel = 0;
+	int cloud_scroll = 0;   /* first visible row on the upload-details list */
 	/* periodic check for photos added to the server while we run */
 	uint64_t last_poll = sceKernelGetProcessTimeWide();
 	int grid_last_sel = -1;   /* sel at the previous frame */
@@ -3722,13 +3867,6 @@ int main(void)
 			}
 		}
 
-		/* SELECT toggles the sync overview from the grid / detail view */
-		if ((pressed & SCE_CTRL_SELECT) && mode != MODE_SYNC) {
-			sync_return_mode = mode;
-			mode = MODE_SYNC;
-			continue;
-		}
-
 		/* d-pad auto-repeat for fast scrolling */
 		const unsigned int dirs = SCE_CTRL_UP | SCE_CTRL_DOWN |
 					  SCE_CTRL_LEFT | SCE_CTRL_RIGHT;
@@ -3744,6 +3882,7 @@ int main(void)
 			int do_search_open = (pressed & SCE_CTRL_TRIANGLE) != 0;
 			int do_search_clear = g_search_active &&
 					      (pressed & SCE_CTRL_CIRCLE) != 0;
+			int do_open_cloud = 0; /* tap on the cloud button */
 
 			if (nav & SCE_CTRL_RIGHT)
 				sel++;
@@ -3887,10 +4026,18 @@ int main(void)
 				} else if (touch_active) {
 					touch_active = 0;
 					if (touch_on_bar) {
-						/* tap on the search bar: clear
-						 * chip while a search is on, else
-						 * open the keyboard */
-						if (g_search_active &&
+						/* tap on the bar: the map/cloud
+						 * buttons are placeholders (no-op),
+						 * the clear chip clears an active
+						 * search, the field opens the
+						 * keyboard */
+						if (touch_x > BTN2_CX - BTN_SZ / 2) {
+							/* cloud button: open the
+							 * server/backup page */
+							do_open_cloud = 1;
+						} else if (touch_x > BAR_M + BAR_W) {
+							/* map button (placeholder) */
+						} else if (g_search_active &&
 						    touch_x > BAR_CLEAR_CX - 16)
 							do_search_clear = 1;
 						else
@@ -3926,6 +4073,11 @@ int main(void)
 						if (c >= 0)
 							sel = c;
 					}
+				}
+
+				if (do_open_cloud) {
+					mode = MODE_CLOUD;
+					continue;
 				}
 
 				/* act on a search request from TRIANGLE/CIRCLE
@@ -4141,7 +4293,7 @@ int main(void)
 			else
 				snprintf(hud, sizeof(hud),
 					 "%d / %d%s   %.10s   X view  /\\ search  "
-					 "SELECT sync  START exit",
+					 "START exit",
 					 sel + 1, g_disp_count,
 					 g_next_page > 0 ? "+" : "",
 					 g_disp_count > 0 ? disp_date(sel) : "");
@@ -4589,142 +4741,214 @@ pf_skip:
 
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
-		} else { /* MODE_SYNC */
-			if ((pressed & SCE_CTRL_CIRCLE) ||
-			    (pressed & SCE_CTRL_SELECT)) {
-				mode = sync_return_mode;
-				detail_idx = -1; /* re-decode on return to detail */
+		} else if (mode == MODE_CLOUD) {
+			/* server + backup overview, opened from the cloud
+			 * button on the search bar */
+			if (g_srv_state == 0) {
+				show_status("Loading server info...");
+				fetch_server_info();
+			}
+
+			int total = g_local_count;
+			int backed = count_state(SYNC_BACKED_UP);
+			int remain = total - backed;
+
+			/* on-screen action buttons (also X = details, /\ = upload) */
+			float bth = 46, bty = 404;
+			float dbx = 60, dbw = 360;             /* See details */
+			float ubx = dbx + dbw + 20, ubw = 320; /* Upload all   */
+			int go_details = (pressed & SCE_CTRL_CROSS) != 0;
+			int do_upload = (pressed & SCE_CTRL_TRIANGLE) != 0;
+
+			if (pressed & SCE_CTRL_CIRCLE) {
+				mode = MODE_GRID;
 				continue;
 			}
-			if (pressed & SCE_CTRL_CROSS) {
+
+			/* touch: tap the button to open the details list */
+			{
+				SceTouchData td;
+				sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
+				if (td.reportNum > 0) {
+					float tx = td.report[0].x * 0.5f;
+					float ty = td.report[0].y * 0.5f;
+					if (!touch_active) {
+						touch_active = 1;
+						touch_dragged = 0;
+						touch_start_x = tx;
+						touch_start_y = ty;
+					} else if (fabsf(tx - touch_start_x) > 12 ||
+						   fabsf(ty - touch_start_y) > 12) {
+						touch_dragged = 1;
+					}
+					touch_x = tx;
+					touch_y = ty;
+				} else if (touch_active) {
+					touch_active = 0;
+					if (!touch_dragged && touch_y >= bty &&
+					    touch_y <= bty + bth) {
+						if (touch_x >= dbx &&
+						    touch_x <= dbx + dbw)
+							go_details = 1;
+						else if (touch_x >= ubx &&
+							 touch_x <= ubx + ubw)
+							do_upload = 1;
+					}
+				}
+			}
+
+			if (do_upload) {
 				int q = queue_all_uploads();
-				log_line("sync: queued %d uploads", q);
+				log_line("cloud: queued %d uploads", q);
 			}
-
-			int backed = count_state(SYNC_BACKED_UP);
-			int local_only = count_state(SYNC_LOCAL_ONLY);
-			int queued = count_state(SYNC_QUEUED) +
-				     count_state(SYNC_UPLOADING);
-			int failed = count_state(SYNC_FAILED);
-			int pending = count_state(SYNC_UNSCANNED) +
-				      count_state(SYNC_HASHING) +
-				      count_state(SYNC_CHECKING);
-
-			/* photo/video split + total and backed-up byte totals */
-			int srv_vid = 0;
-			for (int i = 0; i < g_asset_count; i++)
-				srv_vid += g_asset_is_video[i] ? 1 : 0;
-			int loc_vid = 0;
-			long long loc_bytes = 0, backed_bytes = 0;
-			for (int j = 0; j < g_local_count; j++) {
-				loc_vid += g_local_is_video[j] ? 1 : 0;
-				loc_bytes += g_local_size[j];
-				if (g_local_state[j] == SYNC_BACKED_UP)
-					backed_bytes += g_local_size[j];
+			if (go_details) {
+				mode = MODE_CLOUD_DETAILS;
+				cloud_scroll = 0;
+				continue;
 			}
-			int loc_pct = g_local_count ? (backed * 100 / g_local_count) : 0;
 
 			vita2d_start_drawing();
 			vita2d_clear_screen();
+			draw_centered(40, RGBA8(255, 255, 255, 255),
+				      "Server & Backup");
 
-			draw_centered(40, RGBA8(255, 255, 255, 255), "Sync overview");
-
-			char line[200], sz1[24], sz2[24];
-			int y = 84;
+			char line[300];
 			uint32_t c = RGBA8(220, 220, 220, 255);
-			snprintf(line, sizeof(line),
-				 "Server assets: %d%s  (%d photos, %d videos)",
-				 g_asset_count, g_next_page > 0 ? "+" : "",
-				 g_asset_count - srv_vid, srv_vid);
-			draw_text(60, y, c, 1.0f, line); y += 30;
-			human_size(loc_bytes, sz1, sizeof(sz1));
-			snprintf(line, sizeof(line),
-				 "Local files:   %d  (%d photos, %d videos)  %s",
-				 g_local_count, g_local_count - loc_vid, loc_vid, sz1);
-			draw_text(60, y, c, 1.0f, line); y += 30;
-			snprintf(line, sizeof(line),
-				 "backed up %d   local-only %d   queued/uploading %d",
-				 backed, local_only, queued);
-			draw_text(60, y, c, 1.0f, line); y += 30;
-			snprintf(line, sizeof(line), "scanning/hashing %d   failed %d",
-				 pending, failed);
-			draw_text(60, y, c, 1.0f, line); y += 30;
-			human_size(backed_bytes, sz1, sizeof(sz1));
-			human_size(loc_bytes, sz2, sizeof(sz2));
-			snprintf(line, sizeof(line),
-				 "Backed up: %d%% of local  (%s / %s)",
-				 loc_pct, sz1, sz2);
-			draw_text(60, y,
-					     RGBA8(120, 200, 120, 255), 1.0f, line);
-			y += 38;
+			uint32_t dim = RGBA8(150, 150, 155, 255);
+			int y = 92;
 
-			/* details of the item currently selected in the grid */
-			if (g_disp_count > 0 && sel >= 0 && sel < g_disp_count) {
-				struct disp_item *si = &g_disp[sel];
-				const char *name;
-				if (si->src == SRC_LOCAL) {
-					const char *p = g_local_path[si->idx];
-					const char *slash = strrchr(p, '/');
-					name = slash ? slash + 1 : p;
-				} else {
-					name = g_asset_ids[si->idx];
-				}
-				snprintf(line, sizeof(line), "Selected: %.40s", name);
-				draw_text(60, y, c, 0.95f, line);
-				y += 26;
-				if (si->src == SRC_LOCAL) {
-					human_size(g_local_size[si->idx], sz1,
-						   sizeof(sz1));
-					snprintf(line, sizeof(line),
-						 "  %.19s   %s   %s%s",
-						 g_local_date[si->idx], sz1,
-						 g_local_is_video[si->idx] ?
-							 "video, " : "photo, ",
-						 state_name(g_local_state[si->idx]));
-				} else {
-					snprintf(line, sizeof(line),
-						 "  %.19s   %s   on server",
-						 g_asset_dates[si->idx],
-						 g_asset_is_video[si->idx] ?
-							 "video" : "photo");
-				}
-				draw_text(60, y, c, 0.95f, line);
-			}
-			y += 36;
-
-			/* current activity + upload progress */
-			if (g_sync_activity[0]) {
-				if (g_sync_phase == 3 && g_ul_total > 0) {
-					float frac = (float)g_ul_now / (float)g_ul_total;
-					snprintf(line, sizeof(line), "%s  %.0f%%",
-						 g_sync_activity, frac * 100.0f);
-				} else {
-					snprintf(line, sizeof(line), "%s",
-						 g_sync_activity);
-				}
-				draw_text(60, y,
-						     RGBA8(120, 200, 120, 255),
-						     1.0f, line);
-			}
-			y += 44;
-
-			if (g_sync_errn > 0) {
-				draw_text(60, y,
-						     RGBA8(220, 120, 120, 255),
-						     1.0f, "Recent errors:");
-				y += 30;
-				int shown = g_sync_errn < 5 ? g_sync_errn : 5;
-				for (int k = 0; k < shown && y < 480; k++) {
-					int e = (g_sync_errn - shown + k) % 5;
-					draw_text(60, y,
-							     RGBA8(200, 160, 160, 255),
-							     0.9f, g_sync_errlog[e]);
-					y += 26;
-				}
+			/* server storage with a usage bar */
+			if (g_srv_state == 1 && g_srv_total[0]) {
+				snprintf(line, sizeof(line),
+					 "Server storage: %s of %s used (%d%%)",
+					 g_srv_use[0] ? g_srv_use : "?",
+					 g_srv_total, g_srv_pct);
+				draw_text(60, y, c, 1.0f, line);
+				y += 24;
+				float bw = 600, bh = 14;
+				vita2d_draw_rectangle(60, y, bw, bh,
+						      RGBA8(48, 48, 54, 255));
+				float f = g_srv_pct / 100.0f;
+				if (f < 0) f = 0;
+				if (f > 1) f = 1;
+				vita2d_draw_rectangle(60, y, bw * f, bh,
+						      RGBA8(94, 110, 215, 255));
+				y += 40;
+			} else {
+				draw_text(60, y, dim, 1.0f,
+					  "Server storage: unavailable");
+				y += 40;
 			}
 
-			draw_hud("X upload all local-only    O / SELECT back    START exit");
+			snprintf(line, sizeof(line), "Server version: %s",
+				 g_srv_version[0] ? g_srv_version : "unknown");
+			draw_text(60, y, c, 1.0f, line); y += 30;
+			snprintf(line, sizeof(line), "Server URL: %.48s", g_server);
+			draw_text(60, y, c, 1.0f, line); y += 30;
+			snprintf(line, sizeof(line), "App version: %s", APP_VERSION);
+			draw_text(60, y, c, 1.0f, line); y += 44;
 
+			draw_text(60, y, RGBA8(255, 255, 255, 255), 1.0f,
+				  "On this PS Vita"); y += 30;
+			snprintf(line, sizeof(line), "  Images detected: %d", total);
+			draw_text(60, y, c, 1.0f, line); y += 28;
+			snprintf(line, sizeof(line), "  Backed up: %d", backed);
+			draw_text(60, y, RGBA8(120, 200, 120, 255), 1.0f, line);
+			y += 28;
+			snprintf(line, sizeof(line), "  Remaining: %d", remain);
+			draw_text(60, y, RGBA8(220, 180, 120, 255), 1.0f, line);
+
+			/* See details + Upload all buttons */
+			vita2d_texture *db = rounded_mask_tex((int)dbw, (int)bth, 10.0f);
+			if (db)
+				vita2d_draw_texture_tint(db, dbx, bty,
+							 RGBA8(46, 46, 52, 255));
+			else
+				vita2d_draw_rectangle(dbx, bty, dbw, bth,
+						      RGBA8(46, 46, 52, 255));
+			snprintf(line, sizeof(line), "See details (%d remaining)", remain);
+			draw_text(dbx + 18, bty + bth - 16,
+				  RGBA8(230, 230, 235, 255), 0.95f, line);
+
+			vita2d_texture *ub = rounded_mask_tex((int)ubw, (int)bth, 10.0f);
+			/* the upload button reads as active (indigo) when there's
+			 * something to send, dimmed when everything is backed up */
+			uint32_t uc = remain > 0 ? RGBA8(94, 110, 215, 255)
+						 : RGBA8(46, 46, 52, 255);
+			if (ub)
+				vita2d_draw_texture_tint(ub, ubx, bty, uc);
+			else
+				vita2d_draw_rectangle(ubx, bty, ubw, bth, uc);
+			draw_text(ubx + 18, bty + bth - 16,
+				  RGBA8(245, 245, 250, 255), 0.95f, "Upload all");
+
+			draw_hud("X / tap details    /\\ / tap upload all    O back    START exit");
+			vita2d_end_drawing();
+			vita2d_swap_buffers();
+		} else if (mode == MODE_CLOUD_DETAILS) {
+			/* scrollable list of not-backed-up local files + status */
+			if (pressed & SCE_CTRL_CIRCLE) {
+				mode = MODE_CLOUD;
+				continue;
+			}
+
+			const int top = 86, rowh = 28, rows = (SCREEN_H - top - 40) / rowh;
+			int total_unbacked = g_local_count - count_state(SYNC_BACKED_UP);
+			int maxscroll = total_unbacked - rows;
+			if (maxscroll < 0)
+				maxscroll = 0;
+			if (nav & SCE_CTRL_DOWN)
+				cloud_scroll++;
+			if (nav & SCE_CTRL_UP)
+				cloud_scroll--;
+			if (cloud_scroll > maxscroll)
+				cloud_scroll = maxscroll;
+			if (cloud_scroll < 0)
+				cloud_scroll = 0;
+
+			vita2d_start_drawing();
+			vita2d_clear_screen();
+			char line[300];
+			snprintf(line, sizeof(line), "Not backed up (%d)",
+				 total_unbacked);
+			draw_centered(40, RGBA8(255, 255, 255, 255), line);
+
+			/* walk local files, skipping backed-up ones, render the
+			 * window [cloud_scroll, cloud_scroll+rows) */
+			int seen = 0, drawn = 0, y = top;
+			for (int j = 0; j < g_local_count && drawn < rows; j++) {
+				if (g_local_state[j] == SYNC_BACKED_UP)
+					continue;
+				if (seen++ < cloud_scroll)
+					continue;
+				const char *p = g_local_path[j];
+				const char *slash = strrchr(p, '/');
+				const char *name = slash ? slash + 1 : p;
+				int st = g_local_state[j];
+				const char *stx = st == SYNC_HASHING ? "hashing" :
+						  st == SYNC_UPLOADING ? "uploading" :
+						  st == SYNC_FAILED ? "failed" :
+						  "waiting";
+				uint32_t sc = st == SYNC_UPLOADING ?
+						RGBA8(120, 200, 120, 255) :
+					      st == SYNC_HASHING ?
+						RGBA8(220, 210, 120, 255) :
+					      st == SYNC_FAILED ?
+						RGBA8(220, 120, 120, 255) :
+						RGBA8(170, 170, 178, 255);
+				snprintf(line, sizeof(line), "%.46s", name);
+				draw_text(40, y, RGBA8(220, 220, 220, 255),
+					  0.9f, line);
+				draw_text(SCREEN_W - 170, y, sc, 0.9f, stx);
+				y += rowh;
+				drawn++;
+			}
+			if (total_unbacked == 0)
+				draw_centered(SCREEN_H / 2,
+					      RGBA8(120, 200, 120, 255),
+					      "Everything is backed up");
+
+			draw_hud("Up/Down scroll    O back    START exit");
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
 		}
