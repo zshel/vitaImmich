@@ -18,7 +18,16 @@
 
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
-/* draw an error screen until O is pressed */
+/* the server-side fix for a too-high-bitrate clip, appended to the relevant
+ * error messages so the user knows what to change on their Immich install */
+#define SERVER_FIX_STEPS \
+	"To fix it on the server: in Immich open Administration -> Settings -> " \
+	"Video Transcoding, set Transcode policy to \"All videos\" and Max " \
+	"bitrate to 10000k (or Target resolution to 720p), save, then run the " \
+	"\"Transcode video\" job under Administration -> Jobs."
+
+/* draw an error screen until O is pressed. title and detail are word-wrapped
+ * to the screen, so long messages no longer run off the edges. */
 static void show_blocking_error(const char *title, const char *detail)
 {
 	SceCtrlData pad;
@@ -26,9 +35,11 @@ static void show_blocking_error(const char *title, const char *detail)
 		sceCtrlPeekBufferPositive(0, &pad, 1);
 		vita2d_start_drawing();
 		vita2d_clear_screen();
-		draw_centered(230, RGBA8(255, 80, 80, 255), title);
+		int y = draw_centered_wrapped(150, RGBA8(255, 80, 80, 255),
+					      title, SCREEN_W - 80, 34);
 		if (detail && detail[0])
-			draw_centered(280, RGBA8(200, 200, 200, 255), detail);
+			draw_centered_wrapped(y + 16, RGBA8(205, 205, 205, 255),
+					      detail, SCREEN_W - 80, 30);
 		draw_centered(510, RGBA8(160, 160, 160, 255), "O back");
 		vita2d_end_drawing();
 		vita2d_swap_buffers();
@@ -688,13 +699,12 @@ replay:
 		 * problem. Tell the user instead of holding on a black frame. */
 		log_line("video: active but 0 frames decoded (HW decoder "
 			 "rejected the stream, or running under Vita3K)");
-		show_blocking_error("This video can't be decoded",
-				    "The player started but produced no frames. "
-				    "On a real Vita this usually means the clip's "
-				    "bitrate exceeds the H.264 level it declares - "
-				    "re-transcode it in Immich at a lower bitrate "
-				    "or 720p. (The Vita3K emulator decodes no video "
-				    "at all.)");
+		show_blocking_error("This video's bitrate is too high to play",
+				    "The player started but produced no frames. On a real "
+				    "Vita this means the clip's bitrate exceeds the H.264 "
+				    "level it declares, so the hardware decoder rejects it. "
+				    SERVER_FIX_STEPS
+				    "\n(The Vita3K emulator also decodes no video at all.)");
 	}
 
 	/* reached the end of the video: hold on the last frame with a replay
@@ -745,6 +755,193 @@ replay:
 	__sync_synchronize();
 }
 
+/* ---- pre-download bitrate probe ------------------------------------------
+ * Before pulling the whole stream we fetch just the MP4 header (the small
+ * `moov` box) and decide whether the Vita's hardware H.264 decoder will accept
+ * it. Everything we need is in `moov`: `avcC` carries the declared H.264 level
+ * (which the decoder sizes its buffers from and refuses to overrun), and the
+ * total file size (from the range response) over the `mvhd` duration gives the
+ * average bitrate. If that bitrate exceeds the level's ceiling we show the
+ * "too high" message immediately instead of downloading the whole clip only to
+ * fail at playback. Immich's transcodes are faststart (moov at the front), so
+ * a small head request usually has it; if not, we try the tail. The estimate
+ * is approximate (average vs the decoder's peak/buffer limit), so this only
+ * blocks clear cases and otherwise defers to the real playback attempt. */
+
+enum { PROBE_OK = 0, PROBE_TOO_HIGH = 1, PROBE_UNKNOWN = -1 };
+#define PROBE_HEAD_BYTES (256 * 1024)
+
+static uint32_t rd_be32(const unsigned char *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+	       ((uint32_t)p[2] << 8) | p[3];
+}
+static uint64_t rd_be64(const unsigned char *p)
+{
+	return ((uint64_t)rd_be32(p) << 32) | rd_be32(p + 4);
+}
+
+/* locate a 4CC box tag in a buffer; returns a pointer to the tag (payload
+ * follows immediately after the 4 bytes), or NULL. a plain scan is enough for
+ * the tags we want (avcC/mvhd/moov) — collisions in real files are negligible. */
+static const unsigned char *find_tag(const unsigned char *buf, size_t len,
+				     const char *tag)
+{
+	if (len >= 4)
+		for (size_t i = 0; i + 4 <= len; i++)
+			if (buf[i] == (unsigned char)tag[0] &&
+			    !memcmp(buf + i, tag, 4))
+				return buf + i;
+	return NULL;
+}
+
+/* the H.264 level's bitrate ceiling in Mbps (High-profile MaxBR). the decoder
+ * keys its buffer sizing off this, so a stream above it is what gets rejected. */
+static double level_ceiling_mbps(int lvl)
+{
+	switch (lvl) {
+	case 30: return 12.5;
+	case 31: return 17.5;
+	case 32: return 25.0;
+	case 40: case 41: case 42: return 62.5;
+	case 50: return 168.75;
+	case 51: case 52: return 300.0;
+	default: return lvl >= 51 ? 300.0 : lvl >= 40 ? 62.5 : 17.5;
+	}
+}
+
+/* capture the total file size from a 206's "Content-Range: bytes a-b/TOTAL" */
+static size_t probe_hdr_cb(char *b, size_t s, size_t n, void *ud)
+{
+	size_t len = s * n;
+	long long *total = ud;
+	if (len > 14 && !strncasecmp(b, "Content-Range:", 14)) {
+		char *slash = memchr(b, '/', len);
+		if (slash)
+			*total = strtoll(slash + 1, NULL, 10);
+	}
+	return len;
+}
+
+/* range GET [start,end] of the asset's playback stream into `out`; sets
+ * *total to the full file size from Content-Range. returns the HTTP status,
+ * or -1 on transport error. */
+static int http_get_range(int idx, long start, long end, membuf *out,
+			  long long *total)
+{
+	char url[700];
+	snprintf(url, sizeof(url), "%s/api/assets/%s/video/playback",
+		 g_server, g_asset_ids[idx]);
+	CURL *curl = curl_easy_init();
+	if (!curl)
+		return -1;
+	char keyhdr[300];
+	auth_header(keyhdr, sizeof(keyhdr));
+	struct curl_slist *hdrs = curl_slist_append(NULL, keyhdr);
+	char range[64];
+	snprintf(range, sizeof(range), "%ld-%ld", start, end);
+	out->data = NULL;
+	out->size = 0;
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+	curl_easy_setopt(curl, CURLOPT_RANGE, range);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
+	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, probe_hdr_cb);
+	curl_easy_setopt(curl, CURLOPT_HEADERDATA, total);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "vitaImmich/0.1 (PS Vita)");
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	if (g_resolve_list)
+		curl_easy_setopt(curl, CURLOPT_RESOLVE, g_resolve_list);
+	net_lock();
+	CURLcode res = curl_easy_perform(curl);
+	net_unlock();
+	long code = 0;
+	if (res == CURLE_OK)
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+	curl_slist_free_all(hdrs);
+	curl_easy_cleanup(curl);
+	if (res != CURLE_OK) {
+		free(out->data);
+		out->data = NULL;
+		return -1;
+	}
+	return (int)code;
+}
+
+/* decide from the header whether the clip is decodable. on TOO_HIGH, fills
+ * *level (level_idc, e.g. 31) and *mbps (estimated average bitrate). */
+static int probe_video_bitrate(int idx, int *level, double *mbps)
+{
+	membuf head;
+	long long total = -1;
+	int code = http_get_range(idx, 0, PROBE_HEAD_BYTES - 1, &head, &total);
+	/* need a real partial response (206) with a known total to estimate */
+	if (code != 206 || total <= 0) {
+		log_line("video probe %s: no usable range (code=%d total=%lld)",
+			 g_asset_ids[idx], code, total);
+		free(head.data);
+		return PROBE_UNKNOWN;
+	}
+
+	const unsigned char *sbuf = (const unsigned char *)head.data;
+	size_t slen = head.size;
+	membuf tail;
+	tail.data = NULL;
+	/* faststart files have moov up front; otherwise grab the tail */
+	if (!find_tag(sbuf, slen, "moov") && total > (long long)head.size) {
+		long ts = total > PROBE_HEAD_BYTES ? (long)(total - PROBE_HEAD_BYTES) : 0;
+		long long t2 = -1;
+		if (http_get_range(idx, ts, total - 1, &tail, &t2) == 206) {
+			sbuf = (const unsigned char *)tail.data;
+			slen = tail.size;
+		}
+	}
+
+	const unsigned char *avcc = find_tag(sbuf, slen, "avcC");
+	const unsigned char *mvhd = find_tag(sbuf, slen, "mvhd");
+	int verdict = PROBE_UNKNOWN;
+	/* avcc payload[3] = level_idc; mvhd (v1) reads a 64-bit field at +24,
+	 * so the payload must have 32 bytes available */
+	if (avcc && avcc + 4 + 4 <= sbuf + slen && mvhd && mvhd + 4 + 32 <= sbuf + slen) {
+		int lvl = avcc[4 + 3];
+		const unsigned char *m = mvhd + 4;
+		uint32_t timescale;
+		uint64_t duration;
+		if (m[0] == 1) {              /* version 1: 64-bit times */
+			timescale = rd_be32(m + 20);
+			duration = rd_be64(m + 24);
+		} else {                      /* version 0: 32-bit times */
+			timescale = rd_be32(m + 12);
+			duration = rd_be32(m + 16);
+		}
+		double secs = timescale ? (double)duration / timescale : 0;
+		if (secs > 0.5 && lvl > 0) {
+			double est = (double)total * 8.0 / secs / 1e6;
+			double ceil_mbps = level_ceiling_mbps(lvl);
+			verdict = est > ceil_mbps ? PROBE_TOO_HIGH : PROBE_OK;
+			*level = lvl;
+			*mbps = est;
+			log_line("video probe %s: level %d.%d, ~%.1f Mbps "
+				 "(%lld B / %.1fs), ceiling %.1f -> %s",
+				 g_asset_ids[idx], lvl / 10, lvl % 10, est,
+				 (long long)total, secs, ceil_mbps,
+				 verdict == PROBE_TOO_HIGH ? "reject" : "ok");
+		}
+	}
+	if (verdict == PROBE_UNKNOWN)
+		log_line("video probe %s: header incomplete (avcC=%p mvhd=%p) - "
+			 "deferring to playback", g_asset_ids[idx],
+			 (const void *)avcc, (const void *)mvhd);
+	free(head.data);
+	free(tail.data);
+	return verdict;
+}
+
 /* download + play asset idx, cleaning up the temp file afterwards */
 static void view_video(int idx)
 {
@@ -754,6 +951,32 @@ static void view_video(int idx)
 	if (!g_dl_bg)
 		g_dl_bg = g_thumb[idx];
 	g_video_rot = ori_to_deg(g_asset_rot[idx]);
+
+	/* check the header before committing to the full download, so an
+	 * unplayable (too-high-bitrate) clip is caught up front */
+	vita2d_start_drawing();
+	vita2d_clear_screen();
+	if (g_dl_bg) {
+		draw_texture_fitted(g_dl_bg, 0, 0, SCREEN_W, SCREEN_H);
+		vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, 130));
+	}
+	draw_centered(SCREEN_H / 2, RGBA8(255, 255, 255, 255), "Checking video…");
+	vita2d_end_drawing();
+	vita2d_swap_buffers();
+
+	int level = 0;
+	double mbps = 0;
+	if (probe_video_bitrate(idx, &level, &mbps) == PROBE_TOO_HIGH) {
+		char det[512];
+		snprintf(det, sizeof(det),
+			 "This clip is about %.0f Mbps but declares H.264 Level "
+			 "%d.%d, whose bitrate ceiling the Vita's hardware decoder "
+			 "enforces. " SERVER_FIX_STEPS,
+			 mbps, level / 10, level % 10);
+		show_blocking_error("This video's bitrate is too high to play", det);
+		g_dl_bg = NULL;
+		return;
+	}
 
 	char err[160];
 	int r = download_video(idx, err, sizeof(err));

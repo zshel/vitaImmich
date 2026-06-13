@@ -871,6 +871,19 @@ static int run_smart_search(const char *query)
 	return g_search_count;
 }
 
+/* run the (blocking) smart search off the main thread so the grid can animate
+ * a throbber while the request is in flight. the main thread only draws the
+ * throbber meanwhile, so it never touches the display model this rebuilds. */
+static int search_thread(SceSize args, void *argp)
+{
+	(void)args; (void)argp;
+	int r = run_smart_search(g_search_pending);
+	__sync_synchronize();
+	g_search_result = r;
+	g_search_done = 1;
+	return 0;
+}
+
 static void draw_hud(const char *text)
 {
 	(void)text;   /* bottom HUD bar removed */

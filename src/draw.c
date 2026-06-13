@@ -64,6 +64,59 @@ static void draw_centered(int y, uint32_t color, const char *text)
 	draw_text((SCREEN_W - w) / 2, y, color, 1.0f, text);
 }
 
+/* draw `text` centered and word-wrapped so no line exceeds maxw pixels,
+ * stacking lines line_h px apart. honours explicit '\n' as a hard break.
+ * returns the y just past the last line drawn. used by the error screens,
+ * whose messages used to be one centered line that ran off both edges. */
+static int draw_centered_wrapped(int y, uint32_t color, const char *text,
+				 int maxw, int line_h)
+{
+	char line[256];
+	line[0] = '\0';
+	const char *p = text;
+	for (;;) {
+		while (*p == ' ')        /* collapse runs of spaces between words */
+			p++;
+		const char *w = p;
+		while (*p && *p != ' ' && *p != '\n')
+			p++;
+		int wlen = (int)(p - w);
+		int forced_nl = (*p == '\n');
+		int end = (*p == '\0');
+
+		if (wlen > 0) {
+			char cand[256];
+			if (line[0])
+				snprintf(cand, sizeof(cand), "%s %.*s", line, wlen, w);
+			else
+				snprintf(cand, sizeof(cand), "%.*s", wlen, w);
+			/* place the word if it fits, or if the line is empty (a
+			 * single over-long word goes on its own line rather than
+			 * looping forever) */
+			if (!line[0] || text_width(1.0f, cand) <= maxw) {
+				snprintf(line, sizeof(line), "%s", cand);
+			} else {
+				draw_centered(y, color, line);
+				y += line_h;
+				snprintf(line, sizeof(line), "%.*s", wlen, w);
+			}
+		}
+		if (forced_nl) {
+			draw_centered(y, color, line);
+			y += line_h;
+			line[0] = '\0';
+			p++;             /* consume the '\n' */
+		}
+		if (end) {
+			if (line[0]) {
+				draw_centered(y, color, line);
+				y += line_h;
+			}
+			return y;
+		}
+	}
+}
+
 /* startup loading screen: the Immich logo spinning, with text below it */
 static void draw_loading(const char *text, unsigned int frame)
 {

@@ -74,10 +74,19 @@ static char g_search_query[128];
 static int *g_search_idx;
 static int g_search_count;
 static int g_search_cap;
+/* smart search runs on a worker thread so the grid can animate a throbber
+ * while the request is in flight; g_search_pending is the query it runs,
+ * g_search_done/g_search_result report completion + its return value */
+static char g_search_pending[128];
+static volatile int g_search_done;
+static volatile int g_search_result;
 
 /* server info shown on the cloud/backup page; fetched lazily the first time
- * the page is opened. g_srv_state: 0 not fetched, 1 ok, -1 failed. */
+ * the page is opened. g_srv_state: 0 not fetched, 1 ok, -1 failed.
+ * g_srv_fetching: a worker thread is fetching it now (so the page animates a
+ * throbber instead of blocking the main thread on the request). */
 static int g_srv_state;
+static volatile int g_srv_fetching;
 static char g_srv_use[40];      /* disk used, human ("1.4 TiB") */
 static char g_srv_total[40];    /* disk size, human ("1.8 TiB") */
 static int g_srv_pct;           /* disk usage percentage */

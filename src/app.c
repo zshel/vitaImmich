@@ -11,15 +11,48 @@
 
 enum { MODE_GRID, MODE_DETAIL, MODE_CLOUD, MODE_CLOUD_DETAILS };
 
-/* the first library page is fetched on this thread so the main thread can
- * spin the loading logo while it waits */
-static volatile int g_init_load_done;
-static int init_load_thread(SceSize args, void *argp)
+/* the whole boot workload (auto sign-in, first library page, local media scan)
+ * runs on this one thread so the main thread can animate a single, continuous
+ * spinner from launch to grid instead of flashing a separate static screen per
+ * step. g_boot_status is the caption it shows; g_boot_done signals completion;
+ * g_boot_login_failed asks the main thread to drop to the interactive login. */
+static char g_boot_status[48] = "Loading...";
+static volatile int g_boot_done;
+static volatile int g_boot_login_failed;
+static int boot_thread(SceSize args, void *argp)
 {
 	(void)args; (void)argp;
+	/* stored email/password (no API key, not already signed in): try once */
+	if (!g_apikey[0] && g_email[0] && !g_token[0]) {
+		snprintf(g_boot_status, sizeof(g_boot_status), "Signing in...");
+		char lerr[160];
+		if (do_login(lerr, sizeof(lerr)) != 0) {
+			g_boot_login_failed = 1;
+			__sync_synchronize();
+			g_boot_done = 1;
+			return 0;
+		}
+	}
+	snprintf(g_boot_status, sizeof(g_boot_status), "Loading your library...");
 	fetch_page(0);
+	snprintf(g_boot_status, sizeof(g_boot_status), "Scanning local media...");
+	scan_local_media();
+	/* reserve headroom so a resume-from-sleep rescan can append new camera
+	 * files without reallocating while the worker/sync threads read */
+	grow_locals(g_local_count + 512);
+	rebuild_display();
 	__sync_synchronize();
-	g_init_load_done = 1;
+	g_boot_done = 1;
+	return 0;
+}
+
+/* fetch the cloud page's server info off the main thread, so the page can
+ * animate a throbber while the request is in flight (fetch_server_info sets
+ * g_srv_state to 1/-1 when it finishes) */
+static int srvinfo_thread(SceSize args, void *argp)
+{
+	(void)args; (void)argp;
+	fetch_server_info();
 	return 0;
 }
 
@@ -69,6 +102,7 @@ static void reset_for_account_change(void)
 	g_search_active = 0;
 	g_search_count = 0;
 	g_srv_state = 0;   /* re-fetch the cloud page's server info */
+	g_srv_fetching = 0;
 	__sync_synchronize();
 
 	/* reload from the new account (sync still paused), then resume */
@@ -89,6 +123,14 @@ int main(void)
 	g_ic_server = vita2d_load_PNG_file("app0:cloud_server.png");
 	g_ic_device = vita2d_load_PNG_file("app0:cloud_device.png");
 	g_ic_both   = vita2d_load_PNG_file("app0:cloud_both.png");
+	/* linear (bilinear) sampling so these scale/rotate smoothly instead of
+	 * showing jagged stair-stepped edges (point sampling is the default) */
+	vita2d_texture *icons[] = { g_logo, g_ic_server, g_ic_device, g_ic_both };
+	for (unsigned i = 0; i < sizeof(icons) / sizeof(icons[0]); i++)
+		if (icons[i])
+			vita2d_texture_set_filters(icons[i],
+				SCE_GXM_TEXTURE_FILTER_LINEAR,
+				SCE_GXM_TEXTURE_FILTER_LINEAR);
 
 	/* on-screen keyboard (smart search). the IME runs as a common dialog;
 	 * the config tells it the system language + enter/cancel button map */
@@ -164,30 +206,40 @@ int main(void)
 		log_line("server='%s' len=%d hex=%s", g_server, n, hex);
 	}
 
-	/* auth: API key needs nothing; email/password from config is tried once;
-	 * anything missing or a failed login drops to the interactive sign-in */
-	if (!have_cfg) {
+	/* auth: an API key needs nothing; missing config drops to interactive
+	 * sign-in here. stored email/password is tried inside the boot thread. */
+	if (!have_cfg)
 		login_screen();
-	} else if (!g_apikey[0] && g_email[0]) {
-		draw_loading("Signing in...", 0);
-		char lerr[160];
-		if (do_login(lerr, sizeof(lerr)) != 0)
-			login_screen();
-	}
 
-	/* spinning-logo loading screen while the first page loads on a thread */
-	g_init_load_done = 0;
-	SceUID lt = sceKernelCreateThread("init_load", init_load_thread,
+	/* one continuous spinner: the boot thread signs in (if needed), fetches
+	 * the first page and scans local media while the main thread animates the
+	 * logo with a single, never-resetting frame counter. */
+	g_boot_done = 0;
+	g_boot_login_failed = 0;
+	SceUID bt = sceKernelCreateThread("boot", boot_thread,
 					  0x10000100, 256 * 1024, 0, 0, NULL);
-	if (lt >= 0) {
-		sceKernelStartThread(lt, 0, NULL);
-		unsigned int lf = 0;
-		while (!g_init_load_done) {
-			draw_loading("Loading your library...", lf++);
+	if (bt >= 0) {
+		sceKernelStartThread(bt, 0, NULL);
+		unsigned int bf = 0;
+		while (!g_boot_done) {
+			draw_loading(g_boot_status, bf++);
 			sceDisplayWaitVblankStart();
 		}
 	} else {
-		fetch_page(1);   /* fallback: blocking, no spinner */
+		/* fallback: run the same steps blocking, without the spinner */
+		fetch_page(1);
+		scan_local_media();
+		grow_locals(g_local_count + 512);
+		rebuild_display();
+	}
+	/* a stored-credential sign-in failed: drop to interactive login (main
+	 * thread), then load blocking */
+	if (g_boot_login_failed) {
+		login_screen();
+		fetch_page(1);
+		scan_local_media();
+		grow_locals(g_local_count + 512);
+		rebuild_display();
 	}
 	if (g_asset_count == 0)
 		fatal_error(NULL, "Server returned no assets (see log.txt)");
@@ -196,15 +248,6 @@ int main(void)
 					      0x10000100, 256 * 1024, 0, 0, NULL);
 	if (worker >= 0)
 		sceKernelStartThread(worker, 0, NULL);
-
-	/* scan the Vita's own camera media (fast: paths + stat only), build
-	 * the merged timeline, then let the sync thread hash + dup-check it */
-	draw_loading("Scanning local media...", 0);
-	scan_local_media();
-	/* reserve headroom so a resume-from-sleep rescan can append new camera
-	 * files without reallocating while the worker/sync threads read */
-	grow_locals(g_local_count + 512);
-	rebuild_display();
 
 	SceUID syncw = sceKernelCreateThread("sync_worker", sync_thread,
 					     0x10000100, 256 * 1024, 0, 0, NULL);
@@ -628,8 +671,38 @@ int main(void)
 						g_search_active ? g_search_query : "",
 						q, sizeof(q), 0);
 					if (ok && q[0]) {
-						show_status("Searching \"%s\"...", q);
-						int nres = run_smart_search(q);
+						/* run the search on a worker thread and
+						 * spin a throbber while it's in flight */
+						snprintf(g_search_pending,
+							 sizeof(g_search_pending), "%s", q);
+						g_search_done = 0;
+						SceUID stid = sceKernelCreateThread("search",
+							search_thread, 0x10000100,
+							128 * 1024, 0, 0, NULL);
+						int nres;
+						if (stid >= 0) {
+							sceKernelStartThread(stid, 0, NULL);
+							char cap[160];
+							snprintf(cap, sizeof(cap),
+								 "Searching \"%s\"...", q);
+							unsigned int sf = 0;
+							while (!g_search_done) {
+								vita2d_start_drawing();
+								vita2d_clear_screen();
+								draw_throbber(SCREEN_W / 2.0f,
+									SCREEN_H / 2.0f - 16.0f,
+									22.0f, sf++);
+								draw_centered(SCREEN_H / 2 + 36,
+									RGBA8(200, 200, 200, 255),
+									cap);
+								vita2d_end_drawing();
+								vita2d_swap_buffers();
+							}
+							nres = g_search_result;
+						} else {
+							show_status("Searching \"%s\"...", q);
+							nres = run_smart_search(q);
+						}
 						if (nres >= 0) {
 							sel = 0;
 							scroll = target = 0;
@@ -1277,8 +1350,30 @@ pf_skip:
 			/* server + backup overview, opened from the cloud
 			 * button on the search bar */
 			if (g_srv_state == 0) {
-				show_status("Loading server info...");
-				fetch_server_info();
+				/* fetch on a worker thread so the page animates a
+				 * throbber instead of freezing on the request */
+				if (!g_srv_fetching) {
+					g_srv_fetching = 1;
+					SceUID st = sceKernelCreateThread("srvinfo",
+						srvinfo_thread, 0x10000100,
+						64 * 1024, 0, 0, NULL);
+					if (st >= 0)
+						sceKernelStartThread(st, 0, NULL);
+					else
+						fetch_server_info(); /* fallback */
+				}
+				vita2d_start_drawing();
+				vita2d_clear_screen();
+				draw_throbber(SCREEN_W / 2.0f,
+					      SCREEN_H / 2.0f - 16.0f, 22.0f, frame);
+				draw_centered(SCREEN_H / 2 + 36,
+					      RGBA8(200, 200, 200, 255),
+					      "Loading server info...");
+				if (pressed & SCE_CTRL_CIRCLE)
+					mode = MODE_GRID;
+				vita2d_end_drawing();
+				vita2d_swap_buffers();
+				continue;
 			}
 
 			int total = g_local_count;

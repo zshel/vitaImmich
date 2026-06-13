@@ -10,8 +10,8 @@ just it); the parts are textual slices, so add new code to the relevant part,
 not to CMake. `jsmn.h` is vendored.
 Built with the VitaSDK toolchain into a `.vpk`, run in the **Vita3K** emulator,
 and driven headlessly through the **kwin-mcp** server. This file is the
-end-to-end loop: **build → install → launch → drive → read logs.** For the
-narrative version see `AgenticLoop.md`; full key map is in `controls.MD`.
+end-to-end loop: **build → install → launch → drive → read logs.** Full key
+map is in `controls.MD`.
 
 App title id: **`VIMM00001`**.
 
