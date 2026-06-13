@@ -2,6 +2,16 @@
 
 Task list for the current round of work. Checked items are done.
 
+## 0. UI polish (current round)
+- [x] Hide the white selection square while touch-scrolling; show it again
+      when the selection moves with the d-pad.
+- [x] Square (□) hides/shows the top search bar with a sliding animation.
+      The hidden bar slides up and the grid shifts to fill the vacated strip
+      (escroll = scroll + bar_hidden); the scroll-follow math cancels out.
+- [x] Search results must use the justified/dynamic grid layout: smart search
+      now requests withExif so results carry width/height (without it every
+      asset had no ratio and the grid collapsed to uniform 3 columns).
+
 ## 1. Make asset/local storage scalable (remove 1000 / 500 caps)
 - [x] Replace fixed `MAX_ASSETS` (1000) server-asset arrays with dynamically
       grown (realloc, doubling) arrays.

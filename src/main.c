@@ -2031,12 +2031,14 @@ static int in_tri(float px, float py, float ax, float ay, float bx, float by,
 	return !(neg && pos);
 }
 
+/* shared glyph line thickness (pixels), so every outline reads the same */
+#define GLYPH_W 3.0f
+
 /* a thin ring outline with a straight, round-capped handle off the lower right */
 static int cov_search(float px, float py, int s)
 {
-	float R = s * 0.30f, W = s * 0.11f;
-	if (W < 1.8f) W = 1.8f;
-	float ccx = s * 0.40f, ccy = s * 0.40f, hw = W * 0.5f, c45 = 0.70710678f;
+	float R = s * 0.30f, W = GLYPH_W, hw = W * 0.5f, c45 = 0.70710678f;
+	float ccx = s * 0.40f, ccy = s * 0.40f;
 	float dr = sqrtf((px - ccx) * (px - ccx) + (py - ccy) * (py - ccy));
 	int ring = (dr <= R && dr >= R - W);
 	float ax = ccx + c45 * (R - hw), ay = ccy + c45 * (R - hw);
@@ -2094,12 +2096,57 @@ static vita2d_texture *bake_icon(int s, int (*inside)(float, float, int))
 	return t;
 }
 
+/* PlayStation triangle button glyph: an up-pointing outline, fixed-width edges */
+static int cov_tri(float px, float py, int s)
+{
+	float ax = s * 0.5f, ay = s * 0.10f;   /* lifted up a bit */
+	float bx = s * 0.14f, by = s * 0.80f;
+	float cx = s * 0.86f, cy = s * 0.80f;
+	if (!in_tri(px, py, ax, ay, bx, by, cx, cy))
+		return 0;
+	float d = fminf(seg_dist(px, py, ax, ay, bx, by),
+		  fminf(seg_dist(px, py, bx, by, cx, cy),
+			seg_dist(px, py, cx, cy, ax, ay)));
+	return d <= GLYPH_W;   /* band just inside the edges */
+}
+
+/* PlayStation square button glyph: an outline square, fixed-width border */
+static int cov_sq(float px, float py, int s)
+{
+	float lo = s * 0.18f, hi = s * 0.82f;
+	int outer = px >= lo && px <= hi && py >= lo && py <= hi;
+	int inner = px >= lo + GLYPH_W && px <= hi - GLYPH_W &&
+		    py >= lo + GLYPH_W && py <= hi - GLYPH_W;
+	return outer && !inner;
+}
+
+/* PlayStation cross button glyph: a thick X — two rotated rectangles, so the
+ * arm ends are flat and perpendicular (sharp), not box-clipped or rounded. */
+static int cov_cross(float px, float py, int s)
+{
+	float hw = GLYPH_W * 0.5f;        /* half stroke */
+	float half = s * 0.30f;           /* arm half-length */
+	float dx = px - s * 0.5f, dy = py - s * 0.5f;
+	float a = (dx + dy) * 0.70710678f;   /* along one diagonal */
+	float b = (dx - dy) * 0.70710678f;   /* along the other */
+	return (fabsf(b) <= hw && fabsf(a) <= half) ||
+	       (fabsf(a) <= hw && fabsf(b) <= half);
+}
+
+/* PlayStation circle button glyph: an outline ring, fixed-width stroke */
+static int cov_circle(float px, float py, int s)
+{
+	float cx = s * 0.5f, cy = s * 0.5f, R = s * 0.38f, W = GLYPH_W;
+	float d = sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy));
+	return d <= R && d >= R - W;
+}
+
 /* cache one texture per glyph; all are drawn at a fixed size each frame */
 static vita2d_texture *icon_tex(int which, int s)
 {
-	static vita2d_texture *cache[3];
-	static int cs[3];
-	if (which < 0 || which > 2)
+	static vita2d_texture *cache[7];
+	static int cs[7];
+	if (which < 0 || which > 6)
 		return NULL;
 	if (cache[which] && cs[which] == s)
 		return cache[which];
@@ -2109,7 +2156,11 @@ static vita2d_texture *icon_tex(int which, int s)
 		cache[which] = NULL;
 	}
 	int (*fn)(float, float, int) = which == 0 ? cov_search :
-				       which == 1 ? cov_map : cov_cloud;
+				       which == 1 ? cov_map :
+				       which == 2 ? cov_cloud :
+				       which == 3 ? cov_tri :
+				       which == 4 ? cov_sq :
+				       which == 5 ? cov_cross : cov_circle;
 	cache[which] = bake_icon(s, fn);
 	cs[which] = s;
 	return cache[which];
@@ -2117,14 +2168,69 @@ static vita2d_texture *icon_tex(int which, int s)
 #define ICON_SEARCH 0
 #define ICON_MAP    1
 #define ICON_CLOUD  2
+#define ICON_TRI    3
+#define ICON_SQUARE 4
+#define ICON_CROSS  5
+#define ICON_CIRCLE 6
 
-/* small clear (x) chip used on the right of the bar while a search is on */
-static void draw_clear_x(float cx, float cy, float s, unsigned int col)
+/* a DualShock-style face button: a dark disc (subtle lighter rim) centred at
+ * (cx,cy) with the coloured glyph on top. each glyph keeps a per-call size. */
+/* an anti-aliased filled disc baked into a white alpha mask (4x4 supersampled),
+ * drawn tinted; replaces aliased vita2d_draw_fill_circle for UI discs */
+static vita2d_texture *disc_tex(int d)
 {
-	for (float t = -1.0f; t <= 1.0f; t += 0.2f) {
-		vita2d_draw_fill_circle(cx + t * s, cy + t * s, 1.5f, col);
-		vita2d_draw_fill_circle(cx + t * s, cy - t * s, 1.5f, col);
-	}
+	enum { NDISC = 8 };
+	static vita2d_texture *cache[NDISC];
+	static int cd[NDISC], n;
+	for (int i = 0; i < n; i++)
+		if (cd[i] == d)
+			return cache[i];
+	if (n >= NDISC)
+		return NULL;
+	vita2d_texture *t = vita2d_create_empty_texture_format(d, d,
+		SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+	if (!t)
+		return NULL;
+	uint32_t *data = vita2d_texture_get_datap(t);
+	int stride = (int)(vita2d_texture_get_stride(t) / 4);
+	memset(data, 0, (size_t)stride * d * 4);
+	float c = d / 2.0f, r = d / 2.0f;
+	for (int y = 0; y < d; y++)
+		for (int x = 0; x < d; x++) {
+			int hits = 0;
+			for (int sy = 0; sy < 4; sy++)
+				for (int sx = 0; sx < 4; sx++) {
+					float dx = x + (sx + 0.5f) / 4.0f - c;
+					float dy = y + (sy + 0.5f) / 4.0f - c;
+					if (dx * dx + dy * dy <= r * r)
+						hits++;
+				}
+			data[y * stride + x] = RGBA8(255, 255, 255, hits * 255 / 16);
+		}
+	cache[n] = t;
+	cd[n] = d;
+	n++;
+	return t;
+}
+
+/* a filled (AA) disc at (cx,cy), tinted */
+static void draw_disc(float cx, float cy, float d, uint32_t col)
+{
+	vita2d_texture *t = disc_tex((int)(d + 0.5f));
+	if (t)
+		vita2d_draw_texture_tint(t, cx - (int)(d + 0.5f) / 2.0f,
+					 cy - (int)(d + 0.5f) / 2.0f, col);
+	else
+		vita2d_draw_fill_circle(cx, cy, d / 2.0f, col);
+}
+
+static void draw_ps_button(float cx, float cy, float d, int icon,
+			   uint32_t tint, int gs)
+{
+	draw_disc(cx, cy, d, RGBA8(46, 48, 56, 255));   /* flat dark face */
+	vita2d_texture *g = icon_tex(icon, gs);
+	if (g)
+		vita2d_draw_texture_tint(g, cx - gs / 2.0f, cy - gs / 2.0f, tint);
 }
 
 /* pixel geometry of the search pill + the two buttons on its right, shared
@@ -2142,51 +2248,59 @@ static void draw_clear_x(float cx, float cy, float s, unsigned int col)
 #define BAR_CLEAR_CX (BAR_M + BAR_W - 22.0f) /* centre of the clear chip */
 
 /* one future-feature button: rounded-square background + a centred AA glyph */
-static void draw_bar_button(float cx, int icon)
+static void draw_bar_button(float cx, float cy, int icon)
 {
 	vita2d_texture *bg = rounded_mask_tex((int)BTN_SZ, (int)BTN_SZ, 11.0f);
 	if (bg)
-		vita2d_draw_texture_tint(bg, cx - BTN_SZ / 2, BTN_CY - BTN_SZ / 2,
+		vita2d_draw_texture_tint(bg, cx - BTN_SZ / 2, cy - BTN_SZ / 2,
 					 RGBA8(46, 46, 52, 255));
 	int isz = 26;
 	vita2d_texture *g = icon_tex(icon, isz);
 	if (g)
-		vita2d_draw_texture_tint(g, cx - isz / 2.0f, BTN_CY - isz / 2.0f,
+		vita2d_draw_texture_tint(g, cx - isz / 2.0f, cy - isz / 2.0f,
 					 RGBA8(190, 190, 196, 255));
 }
 
-static void draw_search_bar(void)
+/* draw the bar shifted vertically by `yoff` (Square slides it out of view) */
+static void draw_search_bar(float yoff)
 {
 	unsigned int field = RGBA8(38, 38, 42, 255);
+	float by = BAR_Y + yoff, cy = BTN_CY + yoff;
 	/* opaque strip so grid items scroll cleanly underneath the bar */
-	vita2d_draw_rectangle(0, 0, SCREEN_W, SEARCH_H, RGBA8(16, 16, 16, 255));
+	vita2d_draw_rectangle(0, yoff, SCREEN_W, SEARCH_H, RGBA8(16, 16, 16, 255));
 	/* borderless field: an AA rounded-rect mask tinted to the field colour */
 	vita2d_texture *mask = rounded_mask_tex((int)BAR_W, (int)BAR_H, BAR_R);
 	if (mask)
-		vita2d_draw_texture_tint(mask, BAR_M, BAR_Y, field);
+		vita2d_draw_texture_tint(mask, BAR_M, by, field);
 	else
-		vita2d_draw_rectangle(BAR_M, BAR_Y, BAR_W, BAR_H, field);
+		vita2d_draw_rectangle(BAR_M, by, BAR_W, BAR_H, field);
 
 	int isz = 24;
 	vita2d_texture *icon = icon_tex(ICON_SEARCH, isz);
 	if (icon)
 		vita2d_draw_texture_tint(icon, BAR_M + 22 - isz / 2.0f,
-					 BAR_Y + BAR_H / 2 - isz / 2.0f,
+					 cy - isz / 2.0f,
 					 RGBA8(190, 190, 196, 255));
 
 	/* placeholder buttons (map, cloud) for future features */
-	draw_bar_button(BTN1_CX, ICON_MAP);
-	draw_bar_button(BTN2_CX, ICON_CLOUD);
+	draw_bar_button(BTN1_CX, cy, ICON_MAP);
+	draw_bar_button(BTN2_CX, cy, ICON_CLOUD);
 
-	float tx = BAR_M + 44, ty = BAR_Y + BAR_H - 13;
+	float tx = BAR_M + 44, ty = by + BAR_H - 13;
 	if (g_search_active && g_search_query[0]) {
 		char q[64];
 		snprintf(q, sizeof(q), "%.40s", g_search_query);
 		draw_text(tx, ty, RGBA8(235, 235, 240, 255), 0.95f, q);
-		vita2d_draw_fill_circle(BAR_CLEAR_CX, BAR_Y + BAR_H / 2, 11,
-					RGBA8(70, 70, 76, 255));
-		draw_clear_x(BAR_CLEAR_CX, BAR_Y + BAR_H / 2, 4,
-			     RGBA8(210, 210, 215, 255));
+		/* press O (or tap here) to clear: just the red ring glyph, no
+		 * button disc/border on the pill */
+		{
+			int gs = 26;
+			vita2d_texture *og = icon_tex(ICON_CIRCLE, gs);
+			if (og)
+				vita2d_draw_texture_tint(og,
+					BAR_CLEAR_CX - gs / 2.0f, cy - gs / 2.0f,
+					RGBA8(235, 90, 85, 255));
+		}
 	} else {
 		draw_text(tx, ty, RGBA8(140, 140, 148, 255), 0.95f,
 			  "Search your photos");
@@ -2317,7 +2431,9 @@ static int run_smart_search(const char *query)
 	char url[600];
 	snprintf(url, sizeof(url), "%s/api/search/smart", g_server);
 	char body[320];
-	snprintf(body, sizeof(body), "{\"query\":\"%s\"}", esc);
+	/* withExif so results carry width/height — without it every asset has
+	 * no aspect ratio and the justified grid collapses to uniform columns */
+	snprintf(body, sizeof(body), "{\"query\":\"%s\",\"withExif\":true}", esc);
 
 	membuf buf;
 	long code;
@@ -3825,6 +3941,9 @@ int main(void)
 	int mode = MODE_GRID;
 	int sel = 0;
 	int cloud_scroll = 0;   /* first visible row on the upload-details list */
+	int show_sel = 1;       /* selection square: shown for d-pad, hidden for touch */
+	int bar_shown = 1;      /* top search bar visible */
+	float bar_hidden = 0.0f;/* animated pixels the bar is slid up (0..SEARCH_H) */
 	/* periodic check for photos added to the server while we run */
 	uint64_t last_poll = sceKernelGetProcessTimeWide();
 	int grid_last_sel = -1;   /* sel at the previous frame */
@@ -3871,8 +3990,6 @@ int main(void)
 		unsigned int pressed = pad.buttons & ~prev_buttons;
 		prev_buttons = pad.buttons;
 
-		if (pad.buttons & SCE_CTRL_START)
-			break;
 		frame++;
 
 		/* auto-backup: while enabled, queue any newly-found local-only
@@ -3917,6 +4034,18 @@ int main(void)
 			int do_search_clear = g_search_active &&
 					      (pressed & SCE_CTRL_CIRCLE) != 0;
 			int do_open_cloud = 0; /* tap on the cloud button */
+
+			/* SQUARE slides the top bar in/out; animate the offset */
+			if (pressed & SCE_CTRL_SQUARE)
+				bar_shown = !bar_shown;
+			float bar_t = bar_shown ? 0.0f : (float)SEARCH_H;
+			bar_hidden += (bar_t - bar_hidden) * 0.3f;
+			if (fabsf(bar_t - bar_hidden) < 0.5f)
+				bar_hidden = bar_t;
+			/* the d-pad (and month jumps) bring the selection square
+			 * back; a touch drag hides it again (set below) */
+			if (nav & dirs)
+				show_sel = 1;
 
 			if (nav & SCE_CTRL_RIGHT)
 				sel++;
@@ -4031,15 +4160,19 @@ int main(void)
 						touch_start_y = ty;
 						touch_start_scroll = scroll;
 						touch_vel = 0;
-						/* a contact on the bar opens the
-						 * keyboard instead of scrolling */
-						touch_on_bar = (ty < (float)SEARCH_H);
+						/* a contact on the (visible) bar opens
+						 * the keyboard instead of scrolling */
+						touch_on_bar =
+							(ty < (float)SEARCH_H - bar_hidden);
 					} else if (!touch_on_bar) {
 						float dy = ty - touch_start_y;
 						if (!touch_dragged &&
 						    (dy > 14.0f || dy < -14.0f))
 							touch_dragged = 1;
 						if (touch_dragged) {
+							/* touch-scroll hides the
+							 * selection square */
+							show_sel = 0;
 							float ns = touch_start_scroll - dy;
 							if (ns < 0)
 								ns = 0;
@@ -4082,7 +4215,7 @@ int main(void)
 						 * (videos show their poster +
 						 * play button in the detail) */
 						int i = item_at(touch_x,
-								touch_y + scroll);
+								touch_y + scroll + bar_hidden);
 						if (i >= 0) {
 							sel = i;
 							mode = MODE_DETAIL;
@@ -4191,6 +4324,10 @@ int main(void)
 			if (target > max_scroll)
 				target = max_scroll;
 			scroll += (target - scroll) * 0.35f;
+			/* on-screen scroll: the hidden bar shifts the grid up so
+			 * it fills the vacated strip (the reveal-header math in
+			 * scroll-follow cancels out, so it still uses `scroll`) */
+			float escroll = scroll + bar_hidden;
 
 			/* visible index range (item y is non-decreasing with i),
 			 * computed in the same pass as thumb eviction below */
@@ -4200,7 +4337,7 @@ int main(void)
 			 * the worker is currently loading); evicted textures
 			 * are recycled through the pool, see tex_release */
 			for (int i = 0; i < g_disp_count; i++) {
-				float dy = g_item_y[i] - scroll;
+				float dy = g_item_y[i] - escroll;
 				if (dy > -g_item_h[i] && dy < SCREEN_H) {
 					if (first_vis < 0)
 						first_vis = i;
@@ -4266,7 +4403,7 @@ int main(void)
 
 			/* month/year header bands */
 			for (int h = 0; h < g_sect_count; h++) {
-				float hy = g_sect[h].y - scroll;
+				float hy = g_sect[h].y - escroll;
 				if (hy + HEADER_H < 0 || hy > SCREEN_H)
 					continue;
 				draw_text(10, hy + HEADER_H - 12,
@@ -4279,7 +4416,7 @@ int main(void)
 
 			for (int i = first_vis; i >= 0 && i <= last_vis; i++) {
 				float x = g_item_x[i];
-				float y = g_item_y[i] - scroll;
+				float y = g_item_y[i] - escroll;
 				float bx = x + CELL_PAD, by = y + CELL_PAD;
 				float bw = g_item_w[i] - 2 * CELL_PAD;
 				float bh = g_item_h[i] - 2 * CELL_PAD;
@@ -4303,7 +4440,7 @@ int main(void)
 							     0.85f, "VIDEO");
 				}
 				draw_status_badge(bx, by, i, frame);
-				if (i == sel)
+				if (i == sel && show_sel)
 					draw_sel_outline(x + 2, y + 2,
 							 g_item_w[i] - 4,
 							 g_item_h[i] - 4);
@@ -4314,20 +4451,21 @@ int main(void)
 					      RGBA8(160, 160, 165, 255),
 					      "No results");
 
-			/* pinned Immich-style search bar, on top of the grid */
-			draw_search_bar();
+			/* pinned Immich-style search bar, slid up by bar_hidden
+			 * (Square toggles it); covers items up to its lower edge */
+			draw_search_bar(-bar_hidden);
 
 			char hud[200];
 			if (g_search_active)
 				snprintf(hud, sizeof(hud),
-					 "%d / %d results    /\\ edit  O clear  "
-					 "X view  START exit",
+					 "%d / %d results   /\\ edit  O clear  "
+					 "X view  [] bar",
 					 g_disp_count > 0 ? sel + 1 : 0,
 					 g_disp_count);
 			else
 				snprintf(hud, sizeof(hud),
 					 "%d / %d%s   %.10s   X view  /\\ search  "
-					 "START exit",
+					 "[] bar",
 					 sel + 1, g_disp_count,
 					 g_next_page > 0 ? "+" : "",
 					 g_disp_count > 0 ? disp_date(sel) : "");
@@ -4791,16 +4929,14 @@ pf_skip:
 			 * (also [] = toggle, X = details, /\ = upload) */
 			float tgw = 60, tgh = 30, tgx = 470, tgy = 350;
 			float bth = 46, bty = 408;
-			float dbx = 60, dbw = 360;             /* See details */
-			float ubx = dbx + dbw + 20, ubw = 320; /* Upload all   */
+			float dbx = 56, dbw = 300;   /* See details (X glyph left)  */
+			float ubx = 402, ubw = 300;  /* Upload all  (/\ glyph left) */
 			int go_details = (pressed & SCE_CTRL_CROSS) != 0;
 			int do_upload = (pressed & SCE_CTRL_TRIANGLE) != 0;
 			int do_toggle = (pressed & SCE_CTRL_SQUARE) != 0;
-
-			if (pressed & SCE_CTRL_CIRCLE) {
-				mode = MODE_GRID;
-				continue;
-			}
+			int do_back = (pressed & SCE_CTRL_CIRCLE) != 0;
+			/* O / Back button in the top-right corner */
+			float bkd = 36, bkcx = SCREEN_W - 30, bkcy = 36;
 
 			/* touch: tap the button to open the details list */
 			{
@@ -4824,6 +4960,9 @@ pf_skip:
 					touch_active = 0;
 					if (touch_dragged) {
 						/* ignore drags */
+					} else if (touch_y < bkcy + bkd &&
+						   touch_x > bkcx - bkd - 70) {
+						do_back = 1;   /* top-right Back */
 					} else if (touch_y >= tgy - 6 &&
 						   touch_y <= tgy + tgh + 6 &&
 						   touch_x >= 60 && touch_x <= tgx + tgw) {
@@ -4840,6 +4979,10 @@ pf_skip:
 				}
 			}
 
+			if (do_back) {
+				mode = MODE_GRID;
+				continue;
+			}
 			if (do_toggle) {
 				g_autobackup = !g_autobackup;
 				save_autobackup();
@@ -4862,6 +5005,15 @@ pf_skip:
 			vita2d_clear_screen();
 			draw_centered(40, RGBA8(255, 255, 255, 255),
 				      "Server & Backup");
+
+			/* top-right O / Back button: "Back" label then the circle */
+			{
+				int bw = text_width(0.95f, "Back");
+				draw_text(bkcx - bkd / 2 - 8 - bw, bkcy + 6,
+					  RGBA8(220, 220, 225, 255), 0.95f, "Back");
+				draw_ps_button(bkcx, bkcy, bkd, ICON_CIRCLE,
+					       RGBA8(235, 90, 85, 255), 26);
+			}
 
 			char line[300];
 			uint32_t c = RGBA8(220, 220, 220, 255);
@@ -4921,11 +5073,14 @@ pf_skip:
 				vita2d_draw_rectangle(tgx, tgy, tgw, tgh, trk);
 			float kx = g_autobackup ? tgx + tgw - tgh / 2.0f
 						: tgx + tgh / 2.0f;
-			vita2d_draw_fill_circle(kx, tgy + tgh / 2.0f, tgh / 2.0f - 3.0f,
-						RGBA8(245, 245, 250, 255));
+			draw_disc(kx, tgy + tgh / 2.0f, tgh - 6.0f,
+				  RGBA8(245, 245, 250, 255));
 			draw_text(tgx + tgw + 14, tgy + 21,
 				  g_autobackup ? RGBA8(120, 200, 120, 255) : dim,
 				  0.95f, g_autobackup ? "ON" : "OFF");
+			/* PS square button cueing the [] shortcut, left of switch */
+			draw_ps_button(tgx - 23, tgy + tgh / 2, 38, ICON_SQUARE,
+				       RGBA8(232, 120, 175, 255), 31);
 
 			/* See details + Upload all buttons */
 			vita2d_texture *db = rounded_mask_tex((int)dbw, (int)bth, 10.0f);
@@ -4938,6 +5093,9 @@ pf_skip:
 			snprintf(line, sizeof(line), "See details (%d remaining)", remain);
 			draw_text(dbx + 18, bty + bth - 16,
 				  RGBA8(230, 230, 235, 255), 0.95f, line);
+			/* PS cross button cueing the X shortcut, left of details */
+			draw_ps_button(dbx - 23, bty + bth / 2, 38, ICON_CROSS,
+				       RGBA8(120, 150, 235, 255), 37);
 
 			vita2d_texture *ub = rounded_mask_tex((int)ubw, (int)bth, 10.0f);
 			/* the upload button reads as active (indigo) when there's
@@ -4950,8 +5108,11 @@ pf_skip:
 				vita2d_draw_rectangle(ubx, bty, ubw, bth, uc);
 			draw_text(ubx + 18, bty + bth - 16,
 				  RGBA8(245, 245, 250, 255), 0.95f, "Upload all");
+			/* PS triangle button cueing the /\ shortcut, left of upload */
+			draw_ps_button(ubx - 23, bty + bth / 2, 38, ICON_TRI,
+				       RGBA8(95, 205, 130, 255), 28);
 
-			draw_hud("[] auto-upload   X details   /\\ upload all   O back   START exit");
+			draw_hud("X / tap details    O back");
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
 		} else if (mode == MODE_CLOUD_DETAILS) {
@@ -5017,7 +5178,7 @@ pf_skip:
 					      RGBA8(120, 200, 120, 255),
 					      "Everything is backed up");
 
-			draw_hud("Up/Down scroll    O back    START exit");
+			draw_hud("Up/Down scroll    O back");
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
 		}
