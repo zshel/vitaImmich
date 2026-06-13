@@ -79,6 +79,11 @@ int _newlib_heap_size_user = 192 * 1024 * 1024;
 static char g_server[512];
 static char g_apikey[256];
 static char g_serverip[64];
+/* email/password login: an empty apikey + these triggers POST /api/auth/login
+ * at startup; the returned access token is sent as Authorization: Bearer */
+static char g_email[128];
+static char g_password[128];
+static char g_token[256];
 /* optional DNS pin ("host:port:ip") for routers without NAT loopback */
 static struct curl_slist *g_resolve_list;
 
@@ -492,8 +497,11 @@ static int load_config(void)
 		/* create a template so the user just has to edit it */
 		f = fopen(CONFIG_PATH, "w");
 		if (f) {
-			fputs("server=http://192.168.1.100:2283\n"
-			      "apikey=PASTE_YOUR_IMMICH_API_KEY_HERE\n"
+			fputs("server=https://demo.immich.app\n"
+			      "# auth: an API key, OR an email + password login.\n"
+			      "apikey=\n"
+			      "email=demo@immich.app\n"
+			      "password=demo\n"
 			      "# serverip=192.168.1.100  (optional: LAN IP of the\n"
 			      "#  server, for routers without NAT loopback)\n"
 			      "# syncdir=ux0:picture  (optional, repeatable: folders\n"
@@ -513,6 +521,10 @@ static int load_config(void)
 			snprintf(g_server, sizeof(g_server), "%s", clean_line(s + 7));
 		else if (!strncmp(s, "apikey=", 7))
 			snprintf(g_apikey, sizeof(g_apikey), "%s", clean_line(s + 7));
+		else if (!strncmp(s, "email=", 6))
+			snprintf(g_email, sizeof(g_email), "%s", clean_line(s + 6));
+		else if (!strncmp(s, "password=", 9))
+			snprintf(g_password, sizeof(g_password), "%s", clean_line(s + 9));
 		else if (!strncmp(s, "serverip=", 9))
 			snprintf(g_serverip, sizeof(g_serverip), "%s", clean_line(s + 9));
 		else if (!strncmp(s, "syncdir=", 8)) {
@@ -536,7 +548,12 @@ static int load_config(void)
 	if (n > 0 && g_server[n - 1] == '/')
 		g_server[n - 1] = '\0';
 
-	if (!g_server[0] || !g_apikey[0] || strstr(g_apikey, "PASTE_YOUR"))
+	/* need a server and either an API key or an email+password login */
+	if (strstr(g_apikey, "PASTE_YOUR"))
+		g_apikey[0] = '\0';
+	int have_key = g_apikey[0] != '\0';
+	int have_login = g_email[0] && g_password[0];
+	if (!g_server[0] || (!have_key && !have_login))
 		return -1;
 
 	/* default to http:// when no scheme is given */
@@ -692,6 +709,16 @@ static int curl_debug_cb(CURL *h, curl_infotype type, char *data,
 	return 0;
 }
 
+/* write the right auth header: a login token (Bearer) wins over an API key.
+ * used by the worker/sync curl handles that build their own header lists. */
+static void auth_header(char *buf, size_t n)
+{
+	if (g_token[0])
+		snprintf(buf, n, "Authorization: Bearer %s", g_token);
+	else
+		snprintf(buf, n, "x-api-key: %s", g_apikey);
+}
+
 /* body == NULL -> GET, otherwise POST with a JSON body.
  * ctype (optional) receives the response Content-Type. */
 static CURLcode http_request(const char *url, const char *body,
@@ -708,11 +735,18 @@ static CURLcode http_request(const char *url, const char *body,
 	if (!curl)
 		return CURLE_FAILED_INIT;
 
-	char keyhdr[300];
-	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
-
+	/* auth: a login token (Bearer) wins over an API key; during the login
+	 * request itself both are empty, so no auth header is sent */
+	char authhdr[320];
 	struct curl_slist *hdrs = NULL;
-	hdrs = curl_slist_append(hdrs, keyhdr);
+	if (g_token[0]) {
+		snprintf(authhdr, sizeof(authhdr), "Authorization: Bearer %s",
+			 g_token);
+		hdrs = curl_slist_append(hdrs, authhdr);
+	} else if (g_apikey[0]) {
+		snprintf(authhdr, sizeof(authhdr), "x-api-key: %s", g_apikey);
+		hdrs = curl_slist_append(hdrs, authhdr);
+	}
 	hdrs = curl_slist_append(hdrs, "Accept: application/json, image/jpeg");
 	if (body)
 		hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
@@ -791,6 +825,59 @@ static int json_get(const char *js, size_t len, const char *key,
 	}
 	free(t);
 	return got;
+}
+
+/* log in with email/password and stash the access token in g_token (sent as
+ * Authorization: Bearer afterwards). returns 0 on success. */
+static int do_login(char *err, size_t errlen)
+{
+	/* JSON-escape email + password into the request body */
+	char esc[400];
+	int e = 0;
+	const char *fields[2] = { g_email, g_password };
+	const char *names[2] = { "email", "password" };
+	e += snprintf(esc + e, sizeof(esc) - e, "{");
+	for (int f = 0; f < 2; f++) {
+		e += snprintf(esc + e, sizeof(esc) - e, "%s\"%s\":\"",
+			      f ? "," : "", names[f]);
+		for (const char *p = fields[f]; *p && e < (int)sizeof(esc) - 8; p++) {
+			unsigned char ch = (unsigned char)*p;
+			if (ch == '"' || ch == '\\') {
+				esc[e++] = '\\';
+				esc[e++] = (char)ch;
+			} else if (ch >= 0x20) {
+				esc[e++] = (char)ch;
+			}
+		}
+		e += snprintf(esc + e, sizeof(esc) - e, "\"");
+	}
+	e += snprintf(esc + e, sizeof(esc) - e, "}");
+
+	char url[600];
+	snprintf(url, sizeof(url), "%s/api/auth/login", g_server);
+	membuf buf;
+	long code;
+	CURLcode r = http_request(url, esc, &buf, &code, NULL, 0);
+	if (r != CURLE_OK) {
+		snprintf(err, errlen, "%s", curl_easy_strerror(r));
+		free(buf.data);
+		return -1;
+	}
+	if (code < 200 || code >= 300) {
+		snprintf(err, errlen, "HTTP %ld: %.80s", code,
+			 buf.data ? buf.data : "");
+		free(buf.data);
+		return -1;
+	}
+	if (!buf.data || !json_get(buf.data, buf.size, "accessToken",
+				   g_token, sizeof(g_token))) {
+		snprintf(err, errlen, "no accessToken in response");
+		free(buf.data);
+		return -1;
+	}
+	free(buf.data);
+	log_line("login ok: token %.8s... for %s", g_token, g_email);
+	return 0;
 }
 
 /* GET a JSON endpoint, trying the modern path then a legacy fallback. fills
@@ -1259,7 +1346,7 @@ static int worker_thread(SceSize args, void *argp)
 {
 	CURL *curl = curl_easy_init();
 	char keyhdr[300];
-	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	auth_header(keyhdr, sizeof(keyhdr));
 	struct curl_slist *hdrs = curl_slist_append(NULL, keyhdr);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
@@ -2757,7 +2844,7 @@ static int download_video(int idx, char *err, size_t errlen)
 	}
 
 	char keyhdr[300];
-	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	auth_header(keyhdr, sizeof(keyhdr));
 	struct curl_slist *hdrs = curl_slist_append(NULL, keyhdr);
 
 	curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -3509,7 +3596,7 @@ static void sync_curl_init(void)
 {
 	g_sync_curl = curl_easy_init();
 	char keyhdr[300];
-	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	auth_header(keyhdr, sizeof(keyhdr));
 	g_sync_hdrs = curl_slist_append(NULL, keyhdr);
 	curl_easy_setopt(g_sync_curl, CURLOPT_WRITEFUNCTION, write_cb);
 	curl_easy_setopt(g_sync_curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -3606,7 +3693,7 @@ static void bulk_check_batch(const int *idxs, int n)
 
 	struct curl_slist *hdrs = curl_slist_append(NULL, "Content-Type: application/json");
 	char keyhdr[300];
-	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	auth_header(keyhdr, sizeof(keyhdr));
 	hdrs = curl_slist_append(hdrs, keyhdr);
 
 	membuf buf = { NULL, 0 };
@@ -3665,7 +3752,7 @@ static int upload_item(int j, char *err, size_t errlen)
 	snprintf(url, sizeof(url), "%s/api/assets", g_server);
 
 	char keyhdr[300], sumhdr[80];
-	snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_apikey);
+	auth_header(keyhdr, sizeof(keyhdr));
 	snprintf(sumhdr, sizeof(sumhdr), "x-immich-checksum: %s", g_local_sha1[j]);
 	struct curl_slist *hdrs = curl_slist_append(NULL, keyhdr);
 	hdrs = curl_slist_append(hdrs, sumhdr);
@@ -4005,10 +4092,9 @@ int main(void)
 	}
 
 	if (load_config() != 0)
-		fatal_error("Edit it with VitaShell, then restart the app. "
-			    "Create the API key in the Immich web UI under "
-			    "Account Settings > API Keys.",
-			    "Set your server and API key in " CONFIG_PATH);
+		fatal_error("Edit it with VitaShell, then restart the app. Set "
+			    "server= and either apikey= or email=/password=.",
+			    "Configure your Immich server + login in " CONFIG_PATH);
 
 	/* log the exact bytes of the server URL; invisible characters in the
 	 * config show up here when curl complains about the protocol */
@@ -4018,6 +4104,16 @@ int main(void)
 		for (int i = 0; i < n && i < 64; i++)
 			sprintf(hex + 3 * i, "%02x ", (unsigned char)g_server[i]);
 		log_line("server='%s' len=%d hex=%s", g_server, n, hex);
+	}
+
+	/* no API key: log in with email/password to get a bearer token */
+	if (!g_apikey[0] && g_email[0]) {
+		draw_loading("Signing in...", 0);
+		char lerr[160];
+		if (do_login(lerr, sizeof(lerr)) != 0)
+			fatal_error(lerr,
+				    "Login failed. Check email/password (or use "
+				    "an apikey) in " CONFIG_PATH);
 	}
 
 	/* spinning-logo loading screen while the first page loads on a thread */
