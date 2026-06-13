@@ -2660,7 +2660,7 @@ static void login_screen(void)
 
 		if (activate >= 0) {
 			if (activate == 0) {
-				ime_input("Server URL (https://...)", g_server,
+				ime_input("Server URL", g_server,
 					  g_server, sizeof(g_server), 0);
 				normalize_server();
 			} else if (activate == 1) {
@@ -2717,9 +2717,9 @@ static void login_screen(void)
 		memset(pwmask, '*', pl);
 		pwmask[pl] = '\0';
 		const char *vals[3];
-		vals[0] = g_server[0] ? g_server : "(tap to enter)";
-		vals[1] = g_email[0] ? g_email : "(tap to enter)";
-		vals[2] = g_password[0] ? pwmask : "(tap to enter)";
+		vals[0] = g_server[0] ? g_server : "";
+		vals[1] = g_email[0] ? g_email : "";
+		vals[2] = g_password[0] ? pwmask : "";
 
 		for (int i = 0; i < 3; i++) {
 			float fy = row0 + i * rowgap;
@@ -2764,7 +2764,7 @@ static void login_screen(void)
 		if (dbn)
 			vita2d_draw_texture_tint(dbn, fx, dy, RGBA8(50, 52, 60, 255));
 		draw_centered((int)dy + 30, RGBA8(210, 210, 218, 255),
-			      "Try the demo server");
+			      "Try demo");
 
 		if (errmsg[0])
 			draw_centered(SCREEN_H - 46, RGBA8(220, 120, 120, 255),
