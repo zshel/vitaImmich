@@ -209,6 +209,12 @@ static char g_srv_total[40];    /* disk size, human ("1.8 TiB") */
 static int g_srv_pct;           /* disk usage percentage */
 static char g_srv_version[40];  /* "v1.119.0" */
 
+/* account switch (logout -> login): pause the sync thread while the main
+ * thread drops the old library and reloads, so it can't read/realloc the
+ * arrays mid-reset */
+static volatile int g_pause_bg;    /* request the sync thread to idle */
+static volatile int g_sync_idle;   /* sync thread acknowledges it idled */
+
 /* Texture recycling pool. Freeing a texture unmaps its memblock, and the
  * GPU side (notably Vita3K's texture cache, which re-reads guest memory of
  * cached textures at its own pace) may still touch it afterwards — freeing
@@ -406,9 +412,11 @@ static void draw_loading(const char *text, unsigned int frame)
 	if (g_logo) {
 		float lw = vita2d_texture_get_width(g_logo);
 		float lh = vita2d_texture_get_height(g_logo);
-		float scale = 110.0f / lw;
+		/* draw smaller than the source so the GPU minifies it (smooth
+		 * edges) and spin slowly */
+		float scale = 96.0f / lw;
 		vita2d_draw_texture_scale_rotate_hotspot(g_logo, cx, cy,
-			scale, scale, frame * 0.10f, lw / 2.0f, lh / 2.0f);
+			scale, scale, frame * 0.045f, lw / 2.0f, lh / 2.0f);
 	}
 	int w = text_width(1.0f, text);
 	draw_text((SCREEN_W - w) / 2, cy + 90.0f,
@@ -1345,10 +1353,6 @@ static unsigned char *extract_video_poster(const char *path, int *w, int *h,
 static int worker_thread(SceSize args, void *argp)
 {
 	CURL *curl = curl_easy_init();
-	char keyhdr[300];
-	auth_header(keyhdr, sizeof(keyhdr));
-	struct curl_slist *hdrs = curl_slist_append(NULL, keyhdr);
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
@@ -1434,11 +1438,20 @@ static int worker_thread(SceSize args, void *argp)
 				 g_server, g_req_id);
 			curl_easy_setopt(curl, CURLOPT_URL, url);
 			curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+			/* build auth per request so an account switch (new token)
+			 * takes effect immediately */
+			char keyhdr[300];
+			auth_header(keyhdr, sizeof(keyhdr));
+			struct curl_slist *hdrs = curl_slist_append(NULL, keyhdr);
+			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+			curl_easy_setopt(curl, CURLOPT_RESOLVE, g_resolve_list);
 			net_lock(); /* TLS is single-threaded, see g_net_mutex */
 			res = curl_easy_perform(curl);
 			net_unlock();
 			if (res == CURLE_OK)
 				curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+			curl_slist_free_all(hdrs);
 		}
 
 		if (src == SRC_SERVER && res != CURLE_OK) {
@@ -2065,7 +2078,7 @@ static void draw_sel_outline(float x, float y, float w, float h)
  * texture's bilinear sampling are what soften the corners. */
 static vita2d_texture *rounded_mask_tex(int w, int h, float r)
 {
-	enum { NSLOT = 8 };  /* a small fixed set of shapes (pill, buttons, ...) */
+	enum { NSLOT = 14 }; /* a small fixed set of shapes (pill, buttons, ...) */
 	static vita2d_texture *cache[NSLOT];
 	static int cw[NSLOT], ch[NSLOT];
 	static float cr[NSLOT];
@@ -2498,7 +2511,7 @@ static void utf16_to_utf8(const uint16_t *s, char *out, int outcap)
  * driving the dialog each frame; the worker thread keeps running, which is
  * fine since we touch no shared arrays here. */
 static int ime_input(const char *title, const char *initial,
-		     char *out, size_t outsz)
+		     char *out, size_t outsz, int password)
 {
 	static uint16_t title16[SCE_IME_DIALOG_MAX_TITLE_LENGTH];
 	static uint16_t init16[129];
@@ -2514,7 +2527,8 @@ static int ime_input(const char *title, const char *initial,
 	p.type = SCE_IME_TYPE_DEFAULT;
 	p.option = SCE_IME_OPTION_NO_AUTO_CAPITALIZATION;
 	p.dialogMode = SCE_IME_DIALOG_DIALOG_MODE_WITH_CANCEL;
-	p.textBoxMode = SCE_IME_DIALOG_TEXTBOX_MODE_WITH_CLEAR;
+	p.textBoxMode = password ? SCE_IME_DIALOG_TEXTBOX_MODE_PASSWORD :
+				   SCE_IME_DIALOG_TEXTBOX_MODE_WITH_CLEAR;
 	p.title = title16;
 	p.maxTextLength = 128;
 	p.initialText = init16;
@@ -2546,6 +2560,220 @@ static int ime_input(const char *title, const char *initial,
 		break;
 	}
 	return confirmed;
+}
+
+static void draw_hud(const char *text);   /* defined below */
+
+/* persist server + credentials (and the loader's other settings) to config */
+static void save_config(void)
+{
+	FILE *f = fopen(CONFIG_PATH, "w");
+	if (!f)
+		return;
+	fprintf(f, "server=%s\n", g_server);
+	fprintf(f, "apikey=%s\n", g_apikey);
+	if (g_email[0])    fprintf(f, "email=%s\n", g_email);
+	if (g_password[0]) fprintf(f, "password=%s\n", g_password);
+	if (g_serverip[0]) fprintf(f, "serverip=%s\n", g_serverip);
+	for (int i = 0; i < g_syncdir_count; i++)
+		fprintf(f, "syncdir=%s\n", g_syncdirs[i]);
+	if (g_syncmax_mb != 512)
+		fprintf(f, "syncmaxmb=%ld\n", g_syncmax_mb);
+	fclose(f);
+}
+
+/* give g_server an https:// scheme if it lacks one, strip a trailing slash */
+static void normalize_server(void)
+{
+	size_t n = strlen(g_server);
+	while (n > 0 && g_server[n - 1] == '/')
+		g_server[--n] = '\0';
+	if (g_server[0] && !strstr(g_server, "://")) {
+		char tmp[512];
+		snprintf(tmp, sizeof(tmp), "https://%s", g_server);
+		snprintf(g_server, sizeof(g_server), "%s", tmp);
+	}
+}
+
+/* interactive sign-in: server + email + password via the on-screen keyboard.
+ * blocks until a login succeeds, then saves the config. */
+static void login_screen(void)
+{
+	int sel = 0;          /* 0 server, 1 email, 2 password, 3 log in, 4 demo */
+	char errmsg[160] = "";
+	unsigned int prev = 0, frame = 0;
+	/* field / button geometry, shared by the touch hit-test and the drawer */
+	const float fx = 180, fw = 600, fh = 44, row0 = 200, rowgap = 58;
+	const float by = row0 + 3 * rowgap + 6;   /* Log in button */
+	const float dy = by + fh + 12;            /* Try demo button */
+	int lt_down = 0, lt_drag = 0;
+	float lt_x = 0, lt_y = 0, lt_sx = 0, lt_sy = 0;
+	for (;;) {
+		SceCtrlData pad;
+		sceCtrlPeekBufferPositive(0, &pad, 1);
+		unsigned int pressed = pad.buttons & ~prev;
+		prev = pad.buttons;
+		frame++;
+
+		if (pressed & SCE_CTRL_UP)   sel = (sel + 4) % 5;
+		if (pressed & SCE_CTRL_DOWN) sel = (sel + 1) % 5;
+
+		/* activate an item with X, or by tapping it on the touchscreen */
+		int activate = (pressed & SCE_CTRL_CROSS) ? sel : -1;
+		{
+			SceTouchData td;
+			sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
+			if (td.reportNum > 0) {
+				float tx = td.report[0].x * 0.5f;
+				float ty = td.report[0].y * 0.5f;
+				if (!lt_down) {
+					lt_down = 1;
+					lt_drag = 0;
+					lt_sx = tx;
+					lt_sy = ty;
+				} else if (fabsf(tx - lt_sx) > 14 ||
+					   fabsf(ty - lt_sy) > 14) {
+					lt_drag = 1;
+				}
+				lt_x = tx;
+				lt_y = ty;
+			} else if (lt_down) {
+				lt_down = 0;
+				if (!lt_drag && lt_x >= fx && lt_x <= fx + fw) {
+					for (int i = 0; i < 3; i++) {
+						float fy = row0 + i * rowgap;
+						if (lt_y >= fy && lt_y <= fy + fh) {
+							sel = i;
+							activate = i;
+						}
+					}
+					if (lt_y >= by && lt_y <= by + fh) {
+						sel = 3;
+						activate = 3;
+					} else if (lt_y >= dy && lt_y <= dy + fh) {
+						sel = 4;
+						activate = 4;
+					}
+				}
+			}
+		}
+
+		if (activate >= 0) {
+			if (activate == 0) {
+				ime_input("Server URL (https://...)", g_server,
+					  g_server, sizeof(g_server), 0);
+				normalize_server();
+			} else if (activate == 1) {
+				ime_input("Email", g_email, g_email,
+					  sizeof(g_email), 0);
+			} else if (activate == 2) {
+				ime_input("Password", g_password, g_password,
+					  sizeof(g_password), 1);
+			} else {
+				/* activate 4 = Try demo: prefill the public demo */
+				if (activate == 4) {
+					snprintf(g_server, sizeof(g_server),
+						 "https://demo.immich.app");
+					snprintf(g_email, sizeof(g_email),
+						 "demo@immich.app");
+					snprintf(g_password, sizeof(g_password),
+						 "demo");
+				}
+				g_token[0] = g_apikey[0] = '\0';
+				normalize_server();
+				if (!g_server[0] || !g_email[0] || !g_password[0]) {
+					snprintf(errmsg, sizeof(errmsg),
+						 "Enter server, email and password");
+				} else {
+					draw_loading("Signing in...", frame);
+					char lerr[120];
+					if (do_login(lerr, sizeof(lerr)) == 0) {
+						save_config();
+						return;
+					}
+					snprintf(errmsg, sizeof(errmsg),
+						 "Login failed: %.100s", lerr);
+				}
+			}
+			prev = 0xFFFFFFFF;   /* swallow buttons held in the dialog */
+			lt_down = 0;
+			continue;
+		}
+
+		vita2d_start_drawing();
+		vita2d_clear_screen();
+		if (g_logo) {
+			float lw = vita2d_texture_get_width(g_logo);
+			float s = 72.0f / lw;
+			vita2d_draw_texture_scale(g_logo, SCREEN_W / 2.0f - 36.0f,
+						  44.0f, s, s);
+		}
+		draw_centered(150, RGBA8(255, 255, 255, 255), "Sign in to Immich");
+
+		const char *labels[3] = { "Server", "Email", "Password" };
+		char pwmask[40];
+		int pl = (int)strlen(g_password);
+		if (pl > 24) pl = 24;
+		memset(pwmask, '*', pl);
+		pwmask[pl] = '\0';
+		const char *vals[3];
+		vals[0] = g_server[0] ? g_server : "(tap to enter)";
+		vals[1] = g_email[0] ? g_email : "(tap to enter)";
+		vals[2] = g_password[0] ? pwmask : "(tap to enter)";
+
+		for (int i = 0; i < 3; i++) {
+			float fy = row0 + i * rowgap;
+			if (sel == i) {
+				vita2d_texture *r = rounded_mask_tex(
+					(int)fw + 6, (int)fh + 6, 13.0f);
+				if (r)
+					vita2d_draw_texture_tint(r, fx - 3, fy - 3,
+						RGBA8(94, 110, 215, 255));
+			}
+			vita2d_texture *bx = rounded_mask_tex((int)fw, (int)fh, 10.0f);
+			if (bx)
+				vita2d_draw_texture_tint(bx, fx, fy,
+							 RGBA8(38, 38, 42, 255));
+			draw_text(fx + 14, fy + 16, RGBA8(150, 150, 158, 255),
+				  0.75f, labels[i]);
+			draw_text(fx + 14, fy + 38, RGBA8(230, 230, 235, 255),
+				  0.95f, vals[i]);
+		}
+		if (sel == 3) {
+			vita2d_texture *r = rounded_mask_tex((int)fw + 6,
+							     (int)fh + 6, 13.0f);
+			if (r)
+				vita2d_draw_texture_tint(r, fx - 3, by - 3,
+							 RGBA8(120, 140, 235, 255));
+		}
+		vita2d_texture *lb = rounded_mask_tex((int)fw, (int)fh, 10.0f);
+		if (lb)
+			vita2d_draw_texture_tint(lb, fx, by,
+				RGBA8(94, 110, 215, 255));
+		draw_centered((int)by + 30, RGBA8(245, 245, 250, 255), "Log in");
+
+		/* Try demo button */
+		if (sel == 4) {
+			vita2d_texture *r = rounded_mask_tex((int)fw + 6,
+							     (int)fh + 6, 13.0f);
+			if (r)
+				vita2d_draw_texture_tint(r, fx - 3, dy - 3,
+							 RGBA8(120, 140, 235, 255));
+		}
+		vita2d_texture *dbn = rounded_mask_tex((int)fw, (int)fh, 10.0f);
+		if (dbn)
+			vita2d_draw_texture_tint(dbn, fx, dy, RGBA8(50, 52, 60, 255));
+		draw_centered((int)dy + 30, RGBA8(210, 210, 218, 255),
+			      "Try the demo server");
+
+		if (errmsg[0])
+			draw_centered(SCREEN_H - 46, RGBA8(220, 120, 120, 255),
+				      errmsg);
+		draw_hud("Up/Down select    X edit / log in");
+		vita2d_end_drawing();
+		vita2d_swap_buffers();
+		sceDisplayWaitVblankStart();
+	}
 }
 
 /* run an Immich smart (CLIP) search and switch the grid to its results.
@@ -3839,6 +4067,14 @@ static int sync_thread(SceSize args, void *argp)
 	sync_curl_init();
 
 	for (;;) {
+		/* idle while the main thread resets for an account switch */
+		if (g_pause_bg) {
+			g_sync_idle = 1;
+			sceKernelDelayThread(8 * 1000);
+			continue;
+		}
+		g_sync_idle = 0;
+
 		/* 1. hash + dup-check a batch of freshly scanned files */
 		int batch[100], nb = 0;
 		for (int j = 0; j < g_local_count && nb < 100; j++) {
@@ -4021,6 +4257,62 @@ static int init_load_thread(SceSize args, void *argp)
 	return 0;
 }
 
+/* after a logout + sign-in (possibly a different account): drop the old
+ * library/local lists and reload, with the sync thread paused and the
+ * thumbnail worker drained so nothing reads/writes the arrays mid-reset.
+ * main thread only. */
+static void reset_for_account_change(void)
+{
+	draw_loading("Switching account...", 0);
+
+	/* pause the sync thread (it reads g_local_* directly) */
+	g_pause_bg = 1;
+	for (int i = 0; i < 300 && !g_sync_idle; i++)
+		sceKernelDelayThread(10 * 1000);
+
+	/* drain any in-flight thumbnail request so a late REQ_DONE can't write
+	 * g_thumb[] at an index that's about to become invalid */
+	for (int i = 0; i < 300 && g_req_state == REQ_PENDING; i++)
+		sceKernelDelayThread(10 * 1000);
+	if (g_req_state == REQ_DONE) {
+		free(g_req_pix); g_req_pix = NULL;
+		free(g_req_raw); g_req_raw = NULL;
+	}
+	g_req_state = REQ_IDLE;
+	g_req_idx = -1;
+	__sync_synchronize();
+
+	/* recycle every thumbnail and drop the old library + local lists */
+	vita2d_wait_rendering_done();
+	for (int i = 0; i < g_asset_count; i++)
+		if (g_thumb[i]) {
+			tex_release(g_thumb[i]);
+			g_thumb[i] = NULL;
+			g_thumb_failed[i] = 0;
+		}
+	for (int j = 0; j < g_local_count; j++)
+		if (g_local_thumb[j]) {
+			tex_release(g_local_thumb[j]);
+			g_local_thumb[j] = NULL;
+		}
+	g_asset_count = 0;
+	g_local_count = 0;
+	g_disp_count = 0;
+	g_sect_count = 0;
+	g_next_page = 1;
+	g_search_active = 0;
+	g_search_count = 0;
+	g_srv_state = 0;   /* re-fetch the cloud page's server info */
+	__sync_synchronize();
+
+	/* reload from the new account (sync still paused), then resume */
+	fetch_page(0);
+	scan_local_media();
+	grow_locals(g_local_count + 512);
+	rebuild_display();
+	g_pause_bg = 0;
+}
+
 int main(void)
 {
 	vita2d_init();
@@ -4091,10 +4383,7 @@ int main(void)
 		log_line("protocols: %s", plist);
 	}
 
-	if (load_config() != 0)
-		fatal_error("Edit it with VitaShell, then restart the app. Set "
-			    "server= and either apikey= or email=/password=.",
-			    "Configure your Immich server + login in " CONFIG_PATH);
+	int have_cfg = (load_config() == 0);
 
 	/* log the exact bytes of the server URL; invisible characters in the
 	 * config show up here when curl complains about the protocol */
@@ -4106,14 +4395,15 @@ int main(void)
 		log_line("server='%s' len=%d hex=%s", g_server, n, hex);
 	}
 
-	/* no API key: log in with email/password to get a bearer token */
-	if (!g_apikey[0] && g_email[0]) {
+	/* auth: API key needs nothing; email/password from config is tried once;
+	 * anything missing or a failed login drops to the interactive sign-in */
+	if (!have_cfg) {
+		login_screen();
+	} else if (!g_apikey[0] && g_email[0]) {
 		draw_loading("Signing in...", 0);
 		char lerr[160];
 		if (do_login(lerr, sizeof(lerr)) != 0)
-			fatal_error(lerr,
-				    "Login failed. Check email/password (or use "
-				    "an apikey) in " CONFIG_PATH);
+			login_screen();
 	}
 
 	/* spinning-logo loading screen while the first page loads on a thread */
@@ -4294,8 +4584,12 @@ int main(void)
 				 * move across the elements, down or [] returns to
 				 * the grid, X activates the focused element */
 				show_sel = 0;
-				if ((pressed & SCE_CTRL_SQUARE) ||
-				    (nav & SCE_CTRL_DOWN)) {
+				if (pressed & SCE_CTRL_SQUARE) {
+					/* drop to the grid AND hide the bar */
+					bar_focus = 0;
+					show_sel = 1;
+					bar_shown = 0;
+				} else if (nav & SCE_CTRL_DOWN) {
 					bar_focus = 0;
 					show_sel = 1;
 				} else {
@@ -4548,7 +4842,7 @@ int main(void)
 					char q[128] = "";
 					int ok = ime_input("Search your photos",
 						g_search_active ? g_search_query : "",
-						q, sizeof(q));
+						q, sizeof(q), 0);
 					if (ok && q[0]) {
 						show_status("Searching \"%s\"...", q);
 						int nres = run_smart_search(q);
@@ -5209,8 +5503,11 @@ pf_skip:
 			int do_upload = (pressed & SCE_CTRL_TRIANGLE) != 0;
 			int do_toggle = (pressed & SCE_CTRL_SQUARE) != 0;
 			int do_back = (pressed & SCE_CTRL_CIRCLE) != 0;
+			int do_logout = 0;
 			/* O / Back button in the top-right corner */
 			float bkd = 36, bkcx = SCREEN_W - 30, bkcy = 36;
+			/* Log out button in the top-left corner */
+			float lox = 16, loy = 18, low = 120, loh = 36;
 
 			/* touch: tap the button to open the details list */
 			{
@@ -5237,6 +5534,11 @@ pf_skip:
 					} else if (touch_y < bkcy + bkd &&
 						   touch_x > bkcx - bkd - 70) {
 						do_back = 1;   /* top-right Back */
+					} else if (touch_x >= lox &&
+						   touch_x <= lox + low &&
+						   touch_y >= loy &&
+						   touch_y <= loy + loh) {
+						do_logout = 1; /* top-left Log out */
 					} else if (touch_y >= tgy - 6 &&
 						   touch_y <= tgy + tgh + 6 &&
 						   touch_x >= 60 && touch_x <= tgx + tgw) {
@@ -5255,6 +5557,40 @@ pf_skip:
 
 			if (do_back) {
 				mode = MODE_GRID;
+				continue;
+			}
+			if (do_logout) {
+				/* best-effort server logout, clear credentials,
+				 * persist, then return to the sign-in screen */
+				membuf lb;
+				long lc;
+				char lu[600];
+				snprintf(lu, sizeof(lu), "%s/api/auth/logout",
+					 g_server);
+				http_request(lu, "{}", &lb, &lc, NULL, 0);
+				free(lb.data);
+				g_token[0] = g_apikey[0] = '\0';
+				g_email[0] = g_password[0] = '\0';
+				g_serverip[0] = '\0';  /* drop the old LAN-IP pin */
+				save_config();
+				login_screen();   /* blocks until re-signed-in */
+				/* drop the old account's library + reload */
+				reset_for_account_change();
+				sel = 0;
+				scroll = target = 0;
+				grid_last_sel = -1;
+				for (int k = 0; k < 2; k++) {
+					if (pf_tex[k]) {
+						vita2d_wait_rendering_done();
+						vita2d_free_texture(pf_tex[k]);
+						pf_tex[k] = NULL;
+					}
+					pf_d[k] = -1;
+				}
+				mode = MODE_GRID;
+				detail_idx = -1;
+				prev_buttons = 0xFFFFFFFF; /* swallow held keys */
+				touch_active = 0;
 				continue;
 			}
 			if (do_toggle) {
@@ -5287,6 +5623,18 @@ pf_skip:
 					  RGBA8(220, 220, 225, 255), 0.95f, "Back");
 				draw_ps_button(bkcx, bkcy, bkd, ICON_CIRCLE,
 					       RGBA8(235, 90, 85, 255), 26);
+			}
+
+			/* top-left Log out button */
+			{
+				vita2d_texture *lo = rounded_mask_tex((int)low,
+								      (int)loh, 10.0f);
+				if (lo)
+					vita2d_draw_texture_tint(lo, lox, loy,
+						RGBA8(60, 46, 52, 255));
+				int w = text_width(0.9f, "Log out");
+				draw_text(lox + (low - w) / 2, loy + loh - 13,
+					  RGBA8(235, 200, 205, 255), 0.9f, "Log out");
 			}
 
 			char line[300];
