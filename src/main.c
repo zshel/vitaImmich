@@ -4026,6 +4026,13 @@ int main(void)
 		if (held_frames > 18 && held_frames % 5 == 0)
 			nav |= pad.buttons & dirs;
 
+		/* SELECT opens the cloud / backup page from the grid or detail */
+		if ((pressed & SCE_CTRL_SELECT) &&
+		    (mode == MODE_GRID || mode == MODE_DETAIL)) {
+			mode = MODE_CLOUD;
+			continue;
+		}
+
 		if (mode == MODE_GRID) {
 			/* search bar: TRIANGLE opens the keyboard, CIRCLE (or
 			 * the bar's clear chip) drops back to the timeline. a
