@@ -2908,6 +2908,23 @@ static void draw_throbber(float cx, float cy, float r, unsigned int frame)
 	}
 }
 
+/* grey panel (with a throbber) for a photo that hasn't loaded yet while
+ * swiping; sized to the photo's fitted rect (from its aspect ratio) and
+ * offset horizontally by `xoff`, so it matches where the real image lands */
+static void draw_swipe_placeholder(float xoff, int d, unsigned int frame)
+{
+	float ratio = disp_ratio(d);          /* w/h */
+	float w = SCREEN_W, h = SCREEN_W / ratio;
+	if (h > SCREEN_H) {
+		h = SCREEN_H;
+		w = SCREEN_H * ratio;
+	}
+	float x = (SCREEN_W - w) / 2.0f + xoff;
+	float y = (SCREEN_H - h) / 2.0f;
+	vita2d_draw_rectangle(x, y, w, h, RGBA8(38, 38, 44, 255));
+	draw_throbber(x + w / 2.0f, y + h / 2.0f, 22.0f, frame);
+}
+
 /* translucent play button over a video's poster in the detail view (AA) */
 static void draw_play_overlay(void)
 {
@@ -5059,12 +5076,16 @@ int main(void)
 			int is_local = (it.src == SRC_LOCAL);
 			int is_video = disp_is_video(sel);
 
-			/* zoom with the triggers (continuous while held) */
+			/* zoom with the triggers or the right stick (push up to
+			 * zoom in, down to zoom out), continuous while held */
 			if (!is_video && detail_tex) {
 				if (pad.buttons & SCE_CTRL_RTRIGGER)
 					zoom *= 1.04f;
 				if (pad.buttons & SCE_CTRL_LTRIGGER)
 					zoom /= 1.04f;
+				float rz = (128 - pad.ry) / 128.0f; /* up positive */
+				if (rz > 0.18f || rz < -0.18f)
+					zoom *= 1.0f + rz * 0.05f;
 				if (zoom > 8.0f)
 					zoom = 8.0f;
 				if (zoom < 1.0f) {
@@ -5420,6 +5441,9 @@ pf_skip:
 						draw_texture_fitted(th, slide_x, 0,
 								    SCREEN_W,
 								    SCREEN_H);
+					else
+						draw_swipe_placeholder(slide_x,
+								       sel, frame);
 				}
 				int going_next = (slide_x < 0 || slide_goal < 0);
 				int nb = going_next ? sel + 1 : sel - 1;
@@ -5438,6 +5462,8 @@ pf_skip:
 						draw_texture_fitted(th, nx, 0,
 								    SCREEN_W,
 								    SCREEN_H);
+					else
+						draw_swipe_placeholder(nx, nb, frame);
 				}
 			} else if (is_video) {
 				/* video: its poster with a play button (the
@@ -5484,11 +5510,11 @@ pf_skip:
 					 g_disp_count > 0 ? disp_date(sel) : "",
 					 xhint);
 			draw_hud(hud);
-			/* discreet corner throbber while the full-res image loads,
-			 * only when a preview is showing */
-			if (detail_loading && disp_thumb(sel))
-				draw_throbber(SCREEN_W - 36.0f, 36.0f,
-					      14.0f, frame);
+			/* throbber centred over the preview while the full-res
+			 * image is still loading */
+			if (detail_loading && disp_thumb(sel) && !zoomed && !sliding)
+				draw_throbber(SCREEN_W / 2.0f, SCREEN_H / 2.0f,
+					      24.0f, frame);
 
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
@@ -5822,7 +5848,7 @@ pf_skip:
 				snprintf(line, sizeof(line), "%.46s", name);
 				draw_text(40, y, RGBA8(220, 220, 220, 255),
 					  0.9f, line);
-				draw_text(SCREEN_W - 170, y, sc, 0.9f, stx);
+				draw_text(SCREEN_W - 220, y, sc, 0.9f, stx);
 				y += rowh;
 				drawn++;
 			}
@@ -5830,6 +5856,26 @@ pf_skip:
 				draw_centered(SCREEN_H / 2,
 					      RGBA8(120, 200, 120, 255),
 					      "Everything is backed up");
+
+			/* scroll position: "first-last of total" + a scrollbar */
+			if (total_unbacked > rows) {
+				snprintf(line, sizeof(line), "%d-%d of %d",
+					 cloud_scroll + 1, cloud_scroll + drawn,
+					 total_unbacked);
+				draw_centered(66, RGBA8(150, 150, 158, 255), line);
+
+				float trx = SCREEN_W - 14, ttop = top - 2;
+				float tht = (float)rows * rowh;
+				vita2d_draw_rectangle(trx, ttop, 4, tht,
+						      RGBA8(60, 60, 66, 255));
+				float th_h = tht * (float)rows / total_unbacked;
+				if (th_h < 18)
+					th_h = 18;
+				float th_y = ttop + (tht - th_h) *
+					     (float)cloud_scroll / maxscroll;
+				vita2d_draw_rectangle(trx, th_y, 4, th_h,
+						      RGBA8(160, 160, 170, 255));
+			}
 
 			/* top-right Back button (also press O) */
 			draw_ps_button(bkcx, bkcy, bkd, ICON_CIRCLE,
