@@ -110,6 +110,11 @@ int BZ2_bzDecompressEnd(void *strm) { return -1; }
 static vita2d_pgf *g_font;           /* system font, fallback */
 static vita2d_font *g_ttf;           /* bundled Overpass (Immich's face) */
 static vita2d_texture *g_logo;       /* bundled Immich logo (app0:logo.png) */
+/* cloud status icons (white, from the Immich SVGs): on server / on device /
+ * on both */
+static vita2d_texture *g_ic_server;
+static vita2d_texture *g_ic_device;
+static vita2d_texture *g_ic_both;
 
 /* server-asset arrays. dynamically grown (doubling) as pages are fetched, so
  * the library is bounded only by memory, not a fixed cap. grown on the main
@@ -2179,20 +2184,33 @@ static int cov_map(float px, float py, int s)
 }
 
 /* a filled cloud: three lobes tangent to a flat bottom (rounded sides), with
- * a small body rectangle filling between the side lobes. all kept well inside
- * the icon bounds so nothing clips at the edge. */
+ * a small body rectangle filling between the side lobes. `k` erodes it
+ * uniformly (px) so the outline variant is `filled && !filled(k)`. */
+static int cloud_filled(float px, float py, int s, float k)
+{
+	float yb = s * 0.68f - k;
+	int mid = sqrtf((px - s * 0.50f) * (px - s * 0.50f) +
+			(py - s * 0.42f) * (py - s * 0.42f)) <= s * 0.22f - k;
+	int lp = sqrtf((px - s * 0.34f) * (px - s * 0.34f) +
+		       (py - s * 0.52f) * (py - s * 0.52f)) <= s * 0.16f - k;
+	int rp = sqrtf((px - s * 0.66f) * (px - s * 0.66f) +
+		       (py - s * 0.52f) * (py - s * 0.52f)) <= s * 0.16f - k;
+	int base = (px >= s * 0.34f + k && px <= s * 0.66f - k &&
+		    py >= s * 0.52f + k && py <= yb);
+	return mid || lp || rp || base;
+}
+
 static int cov_cloud(float px, float py, int s)
 {
-	float yb = s * 0.68f;   /* flat bottom */
-	int mid = sqrtf((px - s * 0.50f) * (px - s * 0.50f) +
-			(py - s * 0.42f) * (py - s * 0.42f)) <= s * 0.22f;
-	int lp = sqrtf((px - s * 0.34f) * (px - s * 0.34f) +
-		       (py - s * 0.52f) * (py - s * 0.52f)) <= s * 0.16f;
-	int rp = sqrtf((px - s * 0.66f) * (px - s * 0.66f) +
-		       (py - s * 0.52f) * (py - s * 0.52f)) <= s * 0.16f;
-	int base = (px >= s * 0.34f && px <= s * 0.66f &&
-		    py >= s * 0.52f && py <= yb);
-	return mid || lp || rp || base;
+	return cloud_filled(px, py, s, 0.0f);
+}
+
+/* a cloud outline (the filled shape minus an eroded copy) */
+static int cov_cloud_line(float px, float py, int s)
+{
+	float w = s * 0.12f;
+	if (w < 2.0f) w = 2.0f;
+	return cloud_filled(px, py, s, 0.0f) && !cloud_filled(px, py, s, w);
 }
 
 static vita2d_texture *bake_icon(int s, int (*inside)(float, float, int))
@@ -2272,9 +2290,9 @@ static int cov_play(float px, float py, int s)
 /* cache one texture per glyph; all are drawn at a fixed size each frame */
 static vita2d_texture *icon_tex(int which, int s)
 {
-	static vita2d_texture *cache[8];
-	static int cs[8];
-	if (which < 0 || which > 7)
+	static vita2d_texture *cache[9];
+	static int cs[9];
+	if (which < 0 || which > 8)
 		return NULL;
 	if (cache[which] && cs[which] == s)
 		return cache[which];
@@ -2289,7 +2307,8 @@ static vita2d_texture *icon_tex(int which, int s)
 				       which == 3 ? cov_tri :
 				       which == 4 ? cov_sq :
 				       which == 5 ? cov_cross :
-				       which == 6 ? cov_circle : cov_play;
+				       which == 6 ? cov_circle :
+				       which == 7 ? cov_play : cov_cloud_line;
 	cache[which] = bake_icon(s, fn);
 	cs[which] = s;
 	return cache[which];
@@ -2302,6 +2321,7 @@ static vita2d_texture *icon_tex(int which, int s)
 #define ICON_CROSS  5
 #define ICON_CIRCLE 6
 #define ICON_PLAY   7
+#define ICON_CLOUD_LINE 8
 
 /* a DualShock-style face button: a dark disc (subtle lighter rim) centred at
  * (cx,cy) with the coloured glyph on top. each glyph keeps a per-call size. */
@@ -2870,9 +2890,7 @@ static int run_smart_search(const char *query)
 
 static void draw_hud(const char *text)
 {
-	vita2d_draw_rectangle(0, SCREEN_H - 32, SCREEN_W, 32, RGBA8(0, 0, 0, 180));
-	draw_text(10, SCREEN_H - 9,
-			     RGBA8(255, 255, 255, 255), 1.0f, text);
+	(void)text;   /* bottom HUD bar removed */
 }
 
 /* spinning throbber: a ring of dots with a brightness tail */
@@ -4180,10 +4198,10 @@ static void save_autobackup(void)
 
 /* small colour dot in the top-left corner of a grid cell; a backed-up
  * item also gets a tiny white check, a local-only item an up-arrow */
-static void draw_status_badge(float bx, float by, int d, unsigned int frame)
+static void draw_status_badge(float bx, float by, float bw, float bh,
+			      int d, unsigned int frame)
 {
 	struct disp_item *it = &g_disp[d];
-	uint32_t col;
 	int kind; /* 0 none, 1 cloud, 2 local, 3 busy, 4 backed, 5 failed */
 
 	if (it->src == SRC_SERVER) {
@@ -4201,32 +4219,22 @@ static void draw_status_badge(float bx, float by, int d, unsigned int frame)
 	if (kind == 0)
 		return;
 
-	switch (kind) {
-	case 1: col = RGBA8(120, 150, 200, 255); break; /* cloud: blue-grey */
-	case 2: col = RGBA8(240, 160, 40, 255);  break; /* local: orange */
-	case 3: /* busy: blinking orange */
-		col = (frame / 20) & 1 ? RGBA8(240, 160, 40, 255)
-				       : RGBA8(120, 90, 30, 255);
-		break;
-	case 4: col = RGBA8(80, 200, 100, 255);  break; /* backed: green */
-	default: col = RGBA8(220, 70, 70, 255);  break; /* failed: red */
-	}
-
-	float cx = bx + 14, cy = by + 14, r = 9;
-	vita2d_draw_fill_circle(cx, cy, r + 2, RGBA8(0, 0, 0, 160));
-	vita2d_draw_fill_circle(cx, cy, r, col);
-
-	uint32_t w = RGBA8(255, 255, 255, 255);
-	if (kind == 4) { /* check mark */
-		vita2d_draw_rectangle(cx - 4, cy, 3, 5, w);
-		vita2d_draw_rectangle(cx - 2, cy + 2, 3, 3, w);
-		vita2d_draw_rectangle(cx, cy - 1, 3, 6, w);
-		vita2d_draw_rectangle(cx + 2, cy - 4, 3, 5, w);
-	} else if (kind == 2 || kind == 3) { /* up arrow */
-		vita2d_draw_rectangle(cx - 1, cy - 4, 3, 9, w);
-		vita2d_draw_rectangle(cx - 4, cy - 1, 3, 3, w);
-		vita2d_draw_rectangle(cx + 2, cy - 1, 3, 3, w);
-	}
+	/* Immich cloud status icons (the bundled SVGs): cloud = on server only,
+	 * cloud-off = on device only, cloud-done = on both. White, bottom-right
+	 * of the cell, no background; a 1px dark shadow keeps it legible. */
+	vita2d_texture *ic = (kind == 4) ? g_ic_both :
+			     (kind == 1) ? g_ic_server : g_ic_device;
+	if (!ic)
+		return;
+	const float isz = 26.0f;
+	float ix = bx + bw - isz - 4;    /* bottom-right corner */
+	float iy = by + bh - isz - 4;
+	float s = isz / vita2d_texture_get_width(ic);
+	uint32_t fg = (kind == 5) ? RGBA8(235, 90, 90, 255)
+				  : RGBA8(255, 255, 255, 255);
+	vita2d_draw_texture_tint_scale(ic, ix + 1, iy + 1, s, s,
+				       RGBA8(0, 0, 0, 140));   /* shadow */
+	vita2d_draw_texture_tint_scale(ic, ix, iy, s, s, fg);
 }
 
 /* count local items in a given state */
@@ -4320,6 +4328,9 @@ int main(void)
 	g_font = vita2d_load_default_pgf();
 	g_ttf = vita2d_load_font_file("app0:font.ttf");
 	g_logo = vita2d_load_PNG_file("app0:logo.png");
+	g_ic_server = vita2d_load_PNG_file("app0:cloud_server.png");
+	g_ic_device = vita2d_load_PNG_file("app0:cloud_device.png");
+	g_ic_both   = vita2d_load_PNG_file("app0:cloud_both.png");
 
 	/* on-screen keyboard (smart search). the IME runs as a common dialog;
 	 * the config tells it the system language + enter/cancel button map */
@@ -5009,7 +5020,7 @@ int main(void)
 							     RGBA8(255, 255, 255, 255),
 							     0.85f, "VIDEO");
 				}
-				draw_status_badge(bx, by, i, frame);
+				draw_status_badge(bx, by, bw, bh, i, frame);
 				if (i == sel && show_sel)
 					draw_sel_outline(x + 2, y + 2,
 							 g_item_w[i] - 4,

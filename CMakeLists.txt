@@ -57,4 +57,7 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   FILE ${CMAKE_SOURCE_DIR}/assets/Overpass-SemiBold.ttf font.ttf
   FILE ${CMAKE_SOURCE_DIR}/assets/OFL-Overpass.txt OFL-Overpass.txt
   FILE ${CMAKE_SOURCE_DIR}/assets/immich_logo.png logo.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/cloud_server.png cloud_server.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/cloud_device.png cloud_device.png
+  FILE ${CMAKE_SOURCE_DIR}/assets/cloud_both.png cloud_both.png
 )
