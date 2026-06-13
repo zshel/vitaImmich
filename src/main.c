@@ -2908,10 +2908,11 @@ static void draw_throbber(float cx, float cy, float r, unsigned int frame)
 	}
 }
 
-/* grey panel (with a throbber) for a photo that hasn't loaded yet while
- * swiping; sized to the photo's fitted rect (from its aspect ratio) and
- * offset horizontally by `xoff`, so it matches where the real image lands */
-static void draw_swipe_placeholder(float xoff, int d, unsigned int frame)
+/* grey panel (with a throbber) for a photo that hasn't loaded yet (mid-swipe,
+ * or in the static view before even the low-res preview is in); sized to the
+ * photo's fitted rect (from its aspect ratio) and offset horizontally by
+ * `xoff`, so it matches where the real image lands */
+static void draw_photo_placeholder(float xoff, int d, unsigned int frame)
 {
 	float ratio = disp_ratio(d);          /* w/h */
 	float w = SCREEN_W, h = SCREEN_W / ratio;
@@ -3132,8 +3133,12 @@ static int download_video(int idx, char *err, size_t errlen)
 	CURLcode res = curl_easy_perform(curl);
 	net_unlock();
 	long code = 0;
+	curl_off_t dl = 0;
 	if (res == CURLE_OK)
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+	curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD_T, &dl);
+	log_line("video dl %s: res=%d code=%ld bytes=%lld",
+		 g_asset_ids[idx], res, code, (long long)dl);
 	curl_slist_free_all(hdrs);
 	curl_easy_cleanup(curl);
 	fclose(f);
@@ -3158,7 +3163,12 @@ static int download_video(int idx, char *err, size_t errlen)
 
 static void *av_alloc(void *p, uint32_t alignment, uint32_t size)
 {
-	return memalign(alignment, size);
+	void *r = memalign(alignment, size);
+	/* the AVC decoder's working memory comes through here; a NULL or a big
+	 * alloc is the prime suspect for the player dying right after parse */
+	if (!r || size >= 0x100000)
+		log_line("video: av_alloc %u align %u -> %p", size, alignment, r);
+	return r;
 }
 
 static void av_free(void *p, void *ptr)
@@ -3187,8 +3197,10 @@ static void *av_gpu_alloc(void *p, uint32_t alignment, uint32_t size)
 	}
 	void *base = NULL;
 	sceKernelGetMemBlockBase(mb, &base);
-	sceGxmMapMemory(base, size,
+	int mr = sceGxmMapMemory(base, size,
 			SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
+	log_line("video: gpu_alloc %u bytes align %u -> %p (map 0x%08x)",
+		 size, alignment, base, mr);
 	return base;
 }
 
@@ -3355,6 +3367,7 @@ static unsigned char *extract_video_poster(const char *path, int *w, int *h,
 
 static SceAvPlayerHandle g_avp;
 static volatile int g_av_audio_run;
+static volatile int g_av_audio_frames; /* diag: audio frames pulled this play */
 
 /* sceAudioOutOutput blocks until the previous chunk drains, so this
  * thread is naturally paced by the audio hardware */
@@ -3375,6 +3388,7 @@ static int video_audio_thread(SceSize args, void *argp)
 	while (g_av_audio_run) {
 		if (sceAvPlayerIsActive(g_avp) &&
 		    sceAvPlayerGetAudioData(g_avp, &frame)) {
+			g_av_audio_frames++;
 			sceAudioOutSetConfig(port, -1,
 					     frame.details.audio.sampleRate,
 					     frame.details.audio.channelCount == 1 ?
@@ -3454,6 +3468,7 @@ replay:
 	}
 
 	g_av_audio_run = 1;
+	g_av_audio_frames = 0;
 	SceUID audio_thid = sceKernelCreateThread("video_audio",
 						  video_audio_thread,
 						  0x10000100, 64 * 1024,
@@ -3463,8 +3478,23 @@ replay:
 
 	/* AddSource parses asynchronously; give it ~5 s to start */
 	int active = 0;
-	for (int i = 0; i < 300 && !(active = sceAvPlayerIsActive(g_avp)); i++)
+	int waited = 0;
+	for (waited = 0; waited < 300 && !(active = sceAvPlayerIsActive(g_avp)); waited++)
 		show_video_status("Starting video...");
+	log_line("video: active=%d after %d polls", active, waited);
+
+	/* log every stream the demuxer found (codec/dims) — a video-only stream
+	 * has just one entry, which is fine; this pinpoints decode failures */
+	{
+		SceAvPlayerStreamInfo si;
+		for (int s = 0; s < 4; s++) {
+			memset(&si, 0, sizeof(si));
+			if (sceAvPlayerGetStreamInfo(g_avp, s, &si) < 0)
+				break;
+			log_line("video: stream %d type=%u dur=%llu", s,
+				 (unsigned)si.type, (unsigned long long)si.duration);
+		}
+	}
 
 	/* AddSource parses asynchronously, so the stream duration is usually not
 	 * available yet at this point; keep re-querying it in the loop below until
@@ -3485,9 +3515,29 @@ replay:
 
 	int paused = 0;
 	int ended_eos = 0;
+	int frames = 0;       /* decoded video frames seen this play */
+	int loops = 0;        /* main-loop iterations */
+	int started = 0;      /* a frame has been decoded (real playback began) */
+	/* AddSource is async: the player briefly flips active->inactive->active
+	 * while it spins up its decoders, so an early IsActive==false is NOT the
+	 * end of the stream. Don't treat it as EOS until either a frame has been
+	 * decoded or this startup grace window has elapsed. */
+	uint64_t play_t0 = sceKernelGetProcessTimeWide();
+	int last_act = -1;    /* diag: log IsActive transitions through the loop */
 	unsigned int prev = 0xffffffff; /* swallow the X press that got us here */
 
 	while (active) {
+		loops++;
+		{
+			int a = sceAvPlayerIsActive(g_avp);
+			if (a != last_act) {
+				log_line("video: IsActive=%d at loop %d t=%llums", a,
+					 loops,
+					 (unsigned long long)((sceKernelGetProcessTimeWide()
+							       - play_t0) / 1000));
+				last_act = a;
+			}
+		}
 		SceCtrlData pad;
 		sceCtrlPeekBufferPositive(0, &pad, 1);
 		unsigned int pressed = pad.buttons & ~prev;
@@ -3512,12 +3562,21 @@ replay:
 				sceAvPlayerJumpToTime(g_avp, t);
 		}
 
-		if (!sceAvPlayerIsActive(g_avp)) {
+		if (!sceAvPlayerIsActive(g_avp) &&
+		    (started ||
+		     sceKernelGetProcessTimeWide() - play_t0 > 8000000ULL)) {
 			ended_eos = 1;
-			break; /* end of stream */
+			break; /* end of stream (or never started within 8 s) */
 		}
 
 		if (sceAvPlayerGetVideoData(g_avp, &vframe[buf_idx])) {
+			if (frames == 0)
+				log_line("video: first frame %ux%u pData=%p",
+					 vframe[buf_idx].details.video.width,
+					 vframe[buf_idx].details.video.height,
+					 vframe[buf_idx].pData);
+			frames++;
+			started = 1;
 			sceGxmTextureInitLinear(&vtex[buf_idx].gxm_tex,
 						vframe[buf_idx].pData,
 						SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1,
@@ -3557,11 +3616,33 @@ replay:
 		vita2d_swap_buffers();
 	}
 
+	log_line("video: loop exit frames=%d loops=%d eos=%d audioframes=%d",
+		 frames, loops, ended_eos, g_av_audio_frames);
+
 	if (!active) {
-		log_line("video: player never became active (unsupported codec?)");
+		log_line("video: player never became active");
 		show_blocking_error("Could not play this video",
-				    "The Vita plays MP4 (H.264/AAC) only; "
-				    "check Immich transcoding settings.");
+				    "The player never started. The Vita decodes "
+				    "H.264/AAC only; if this is HEVC, set Immich "
+				    "Video Transcoding to convert it to H.264.");
+	} else if (frames == 0) {
+		/* the player parsed the file and went active, allocated its
+		 * decoder buffers, then aborted without ever emitting a frame.
+		 * On hardware this happens when the H.264 stream overruns the
+		 * limits of the level declared in its SPS (e.g. a ~19 Mbps clip
+		 * tagged Level 3.1, whose ceiling is 14 Mbps): the hardware
+		 * decoder sizes its buffers from the declared level and rejects
+		 * the stream. Not fixable client-side — the transcode is the
+		 * problem. Tell the user instead of holding on a black frame. */
+		log_line("video: active but 0 frames decoded (HW decoder "
+			 "rejected the stream, or running under Vita3K)");
+		show_blocking_error("This video can't be decoded",
+				    "The player started but produced no frames. "
+				    "On a real Vita this usually means the clip's "
+				    "bitrate exceeds the H.264 level it declares - "
+				    "re-transcode it in Immich at a lower bitrate "
+				    "or 720p. (The Vita3K emulator decodes no video "
+				    "at all.)");
 	}
 
 	/* reached the end of the video: hold on the last frame with a replay
@@ -3569,7 +3650,7 @@ replay:
 	 * back to the detail screen and would re-download to play it again). X
 	 * replays from the still-local file; O leaves. The decoder buffers behind
 	 * `cur` are still valid here — teardown happens below, after this loop. */
-	if (ended_eos) {
+	if (ended_eos && frames > 0) {
 		unsigned int eprev = 0xffffffff;
 		for (;;) {
 			SceCtrlData pad;
@@ -4484,6 +4565,7 @@ int main(void)
 	uint64_t last_poll = sceKernelGetProcessTimeWide();
 	int grid_last_sel = -1;   /* sel at the previous frame */
 	int grid_settle = 0;      /* frames since sel last changed */
+	int rl_idle = 1000;       /* frames since the last R/L month jump */
 	float scroll = 0.0f, target = 0.0f;
 	unsigned int prev_buttons = 0;
 	unsigned int held_frames = 0;
@@ -4659,11 +4741,23 @@ int main(void)
 			    g_disp_count > 0) {
 				int dir = (pressed & SCE_CTRL_RTRIGGER) ?
 					  +1 : -1;
+				/* Only the FIRST deliberate jump after a pause
+				 * may pull pages. rl_idle counts frames since the
+				 * last R/L jump; a settle threshold alone isn't
+				 * enough because mashing R at >12-frame intervals
+				 * lets grid_settle creep back to 12 between
+				 * presses, firing the blocking fetch+rebuild loop
+				 * on every press. Gate on the PREVIOUS idle span
+				 * (before resetting it for this press), so spam
+				 * jumps stay purely in-memory and the catch-up
+				 * fetch waits until you actually stop. */
+				int can_pull = (rl_idle >= 30);
+				rl_idle = 0;
 				/* jumping down: the next month may simply not
-				 * be fetched yet — pull pages until a new
-				 * month shows up (or the library ends). search
-				 * results aren't paginated, so skip the pull. */
-				if (dir > 0 && !g_search_active) {
+				 * be fetched yet — pull pages until a new month
+				 * shows up (or the library ends). search results
+				 * aren't paginated, so skip the pull. */
+				if (dir > 0 && !g_search_active && can_pull) {
 					int guard = 0;
 					while (g_next_page > 0 && guard++ < 10 &&
 					       !strncmp(disp_date(month_jump(sel, +1)),
@@ -4699,6 +4793,8 @@ int main(void)
 			} else if (grid_settle < 1000) {
 				grid_settle++;
 			}
+			if (rl_idle < 1000)
+				rl_idle++;
 			int scrolling_fast = (grid_settle < 12);
 
 			if ((pressed & SCE_CTRL_CROSS) && g_disp_count > 0 &&
@@ -4717,7 +4813,7 @@ int main(void)
 			 * end (gated on !scrolling_fast, see above). no loading
 			 * screen: the grid stays up, the HUD's "+" already says
 			 * more is coming, and the fetch only blocks briefly */
-			if (!scrolling_fast && !g_search_active &&
+			if (!scrolling_fast && rl_idle >= 12 && !g_search_active &&
 			    g_next_page > 0 &&
 			    sel >= g_disp_count - COLS * 4) {
 				if (fetch_page(0) > 0)
@@ -5442,7 +5538,7 @@ pf_skip:
 								    SCREEN_W,
 								    SCREEN_H);
 					else
-						draw_swipe_placeholder(slide_x,
+						draw_photo_placeholder(slide_x,
 								       sel, frame);
 				}
 				int going_next = (slide_x < 0 || slide_goal < 0);
@@ -5463,7 +5559,7 @@ pf_skip:
 								    SCREEN_W,
 								    SCREEN_H);
 					else
-						draw_swipe_placeholder(nx, nb, frame);
+						draw_photo_placeholder(nx, nb, frame);
 				}
 			} else if (is_video) {
 				/* video: its poster with a play button (the
@@ -5479,15 +5575,14 @@ pf_skip:
 				draw_texture_zoom(detail_tex, zoom, &panx, &pany);
 			} else if (detail_loading) {
 				/* low-res grid thumb blown up while the full
-				 * image is still on its way */
+				 * image is still on its way; no preview yet ->
+				 * a grey placeholder sized to the photo */
 				vita2d_texture *th = disp_thumb(sel);
 				if (th)
 					draw_texture_fitted(th, 0, 0,
 							    SCREEN_W, SCREEN_H);
 				else
-					draw_throbber(SCREEN_W / 2.0f,
-						      SCREEN_H / 2.0f,
-						      28.0f, frame);
+					draw_photo_placeholder(0, sel, frame);
 			} else if (it.src == SRC_SERVER) {
 				draw_error_detail(it.idx);
 			} else {
