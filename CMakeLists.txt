@@ -38,6 +38,7 @@ target_link_libraries(${PROJECT_NAME}
   SceCtrl_stub
   SceTouch_stub
   SceCommonDialog_stub
+  SceIme_stub
   ScePgf_stub
   SceAppMgr_stub
   SceNet_stub

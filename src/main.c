@@ -39,6 +39,8 @@
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
 #include <psp2/sysmodule.h>
+#include <psp2/ime_dialog.h>
+#include <psp2/common_dialog.h>
 
 #include <vita2d.h>
 #include <curl/curl.h>
@@ -57,6 +59,7 @@
 #define ROW_H      200   /* justified-grid row height; widths follow aspect */
 #define CELL_PAD   3
 #define HEADER_H   40            /* month/year band height in the grid */
+#define SEARCH_H   56            /* pinned Immich-style search bar at the top */
 #define THUMB_MAX  256   /* decode grid thumbs down to <= this dimension */
 #define FULL_MAX   4096  /* GXM texture size limit */
 
@@ -173,6 +176,18 @@ static struct sect_hdr *g_sect;
 static int g_sect_count;
 static int g_sect_cap;
 static float g_content_h; /* total scrollable height incl. headers */
+
+/* free-text smart (CLIP) search. when active the grid shows only the matching
+ * server assets — still date-grouped under month headers like the timeline —
+ * instead of the full merged library; TRIANGLE opens the keyboard, CIRCLE (or
+ * the bar's clear chip) returns to the timeline. g_search_idx holds indices
+ * into the g_asset_* arrays (those never reorder, only grow), in the order the
+ * server returned them. */
+static int g_search_active;
+static char g_search_query[128];
+static int *g_search_idx;
+static int g_search_count;
+static int g_search_cap;
 
 /* Texture recycling pool. Freeing a texture unmaps its memblock, and the
  * GPU side (notably Vita3K's texture cache, which re-reads guest memory of
@@ -1511,7 +1526,9 @@ static void layout_finish_row(int start, int end, float *y, float natw,
 static void layout_grid(void)
 {
 	g_sect_count = 0;
-	float y = 0.0f, natw = 0.0f;
+	/* start below the pinned search bar so the first month header clears
+	 * it at the top of the scroll range */
+	float y = SEARCH_H, natw = 0.0f;
 	int row_start = 0;
 	char curkey[8] = "";
 
@@ -1558,6 +1575,23 @@ static void layout_grid(void)
  * server asset is shown once, as the server asset (green badge). */
 static void rebuild_display(void)
 {
+	/* search mode: the merged timeline is replaced by the result set
+	 * (server assets only, date-grouped); local media isn't folded in */
+	if (g_search_active) {
+		if (!grow_disp(g_search_count > 0 ? g_search_count : 1))
+			return;
+		int n = 0;
+		for (int k = 0; k < g_search_count; k++) {
+			g_disp[n].src = SRC_SERVER;
+			g_disp[n].idx = g_search_idx[k];
+			n++;
+		}
+		g_disp_count = n;
+		qsort(g_disp, n, sizeof(g_disp[0]), disp_cmp);
+		layout_grid();
+		return;
+	}
+
 	for (int i = 0; i < g_asset_count; i++)
 		g_asset_local_backed[i] = 0;
 
@@ -1810,6 +1844,365 @@ static void draw_sel_outline(float x, float y, float w, float h)
 	vita2d_draw_rectangle(x, y + h - t, w, t, c);
 	vita2d_draw_rectangle(x, y, t, h, c);
 	vita2d_draw_rectangle(x + w - t, y, t, h, c);
+}
+
+/* ---- Immich-style top search bar ----------------------------------- */
+
+/* an anti-aliased filled rounded rectangle, baked once into a white alpha
+ * mask texture (4x4 supersampled corner coverage) and drawn tinted to the
+ * wanted colour. vita2d has no AA primitives, so the coverage mask + the
+ * texture's bilinear sampling are what soften the corners. */
+static vita2d_texture *rounded_mask_tex(int w, int h, float r)
+{
+	static vita2d_texture *cache;
+	static int cw, ch;
+	static float cr;
+	if (cache && cw == w && ch == h && cr == r)
+		return cache;
+	if (cache) {
+		vita2d_wait_rendering_done();
+		vita2d_free_texture(cache);
+		cache = NULL;
+	}
+	vita2d_texture *t = vita2d_create_empty_texture_format(w, h,
+		SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+	if (!t)
+		return NULL;
+	uint32_t *data = vita2d_texture_get_datap(t);
+	int stride = (int)(vita2d_texture_get_stride(t) / 4); /* pixels/row */
+	memset(data, 0, (size_t)stride * h * 4); /* keep row padding transparent */
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			int hits = 0;
+			for (int sy = 0; sy < 4; sy++)
+				for (int sx = 0; sx < 4; sx++) {
+					float px = x + (sx + 0.5f) / 4.0f;
+					float py = y + (sy + 0.5f) / 4.0f;
+					/* nearest point of the corner-centre
+					 * rectangle inset by r */
+					float qx = px < r ? r :
+						(px > w - r ? w - r : px);
+					float qy = py < r ? r :
+						(py > h - r ? h - r : py);
+					float dx = px - qx, dy = py - qy;
+					if (dx * dx + dy * dy <= r * r)
+						hits++;
+				}
+			data[y * stride + x] = RGBA8(255, 255, 255,
+						     hits * 255 / 16);
+		}
+	}
+	cache = t;
+	cw = w;
+	ch = h;
+	cr = r;
+	return cache;
+}
+
+/* a line-art magnifying glass baked into an AA white mask (4x4 supersampled):
+ * a thin ring outline plus a straight, round-capped handle off the lower
+ * right. drawn tinted to the icon colour. cached at one size. */
+static vita2d_texture *search_icon_tex(int s)
+{
+	static vita2d_texture *cache;
+	static int cs;
+	if (cache && cs == s)
+		return cache;
+	if (cache) {
+		vita2d_wait_rendering_done();
+		vita2d_free_texture(cache);
+		cache = NULL;
+	}
+	vita2d_texture *t = vita2d_create_empty_texture_format(s, s,
+		SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+	if (!t)
+		return NULL;
+	uint32_t *data = vita2d_texture_get_datap(t);
+	int stride = (int)(vita2d_texture_get_stride(t) / 4);
+	memset(data, 0, (size_t)stride * s * 4);
+
+	float R = s * 0.30f;          /* ring outer radius */
+	float W = s * 0.11f;          /* stroke width */
+	if (W < 1.8f) W = 1.8f;
+	float ccx = s * 0.40f, ccy = s * 0.40f;   /* ring centre */
+	float hw = W * 0.5f;
+	float c45 = 0.70710678f;
+	/* handle segment, 45 deg toward the lower-right corner */
+	float ax = ccx + c45 * (R - hw), ay = ccy + c45 * (R - hw);
+	float bx = ccx + c45 * (R + s * 0.42f), by = ccy + c45 * (R + s * 0.42f);
+	float seg2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+
+	for (int y = 0; y < s; y++) {
+		for (int x = 0; x < s; x++) {
+			int hits = 0;
+			for (int sy = 0; sy < 4; sy++)
+				for (int sx = 0; sx < 4; sx++) {
+					float px = x + (sx + 0.5f) / 4.0f;
+					float py = y + (sy + 0.5f) / 4.0f;
+					float dr = sqrtf((px - ccx) * (px - ccx) +
+							 (py - ccy) * (py - ccy));
+					int in = (dr <= R && dr >= R - W);
+					/* distance to the handle segment */
+					float tt = seg2 > 0 ?
+						((px - ax) * (bx - ax) +
+						 (py - ay) * (by - ay)) / seg2 : 0;
+					if (tt < 0) tt = 0;
+					if (tt > 1) tt = 1;
+					float hxp = ax + (bx - ax) * tt;
+					float hyp = ay + (by - ay) * tt;
+					float dh = sqrtf((px - hxp) * (px - hxp) +
+							 (py - hyp) * (py - hyp));
+					if (in || dh <= hw)
+						hits++;
+				}
+			data[y * stride + x] = RGBA8(255, 255, 255,
+						     hits * 255 / 16);
+		}
+	}
+	cache = t;
+	cs = s;
+	return cache;
+}
+
+/* small clear (x) chip used on the right of the bar while a search is on */
+static void draw_clear_x(float cx, float cy, float s, unsigned int col)
+{
+	for (float t = -1.0f; t <= 1.0f; t += 0.2f) {
+		vita2d_draw_fill_circle(cx + t * s, cy + t * s, 1.5f, col);
+		vita2d_draw_fill_circle(cx + t * s, cy - t * s, 1.5f, col);
+	}
+}
+
+/* pixel geometry of the search pill, shared by the drawer and the tap test */
+#define BAR_M  12.0f                       /* left/right margin */
+#define BAR_Y  8.0f                        /* top of the pill */
+#define BAR_H  40.0f                       /* pill height */
+#define BAR_R  12.0f                       /* corner radius */
+#define BAR_W  ((float)SCREEN_W - 2 * BAR_M)
+#define BAR_CLEAR_CX (BAR_M + BAR_W - 22.0f) /* centre of the clear chip */
+
+static void draw_search_bar(void)
+{
+	unsigned int field = RGBA8(38, 38, 42, 255);
+	/* opaque strip so grid items scroll cleanly underneath the bar */
+	vita2d_draw_rectangle(0, 0, SCREEN_W, SEARCH_H, RGBA8(16, 16, 16, 255));
+	/* borderless field: an AA rounded-rect mask tinted to the field colour */
+	vita2d_texture *mask = rounded_mask_tex((int)BAR_W, (int)BAR_H, BAR_R);
+	if (mask)
+		vita2d_draw_texture_tint(mask, BAR_M, BAR_Y, field);
+	else
+		vita2d_draw_rectangle(BAR_M, BAR_Y, BAR_W, BAR_H, field);
+
+	int isz = 24;
+	vita2d_texture *icon = search_icon_tex(isz);
+	if (icon)
+		vita2d_draw_texture_tint(icon, BAR_M + 22 - isz / 2.0f,
+					 BAR_Y + BAR_H / 2 - isz / 2.0f,
+					 RGBA8(190, 190, 196, 255));
+
+	float tx = BAR_M + 44, ty = BAR_Y + BAR_H - 13;
+	if (g_search_active && g_search_query[0]) {
+		char q[64];
+		snprintf(q, sizeof(q), "%.40s", g_search_query);
+		draw_text(tx, ty, RGBA8(235, 235, 240, 255), 0.95f, q);
+		vita2d_draw_fill_circle(BAR_CLEAR_CX, BAR_Y + BAR_H / 2, 11,
+					RGBA8(70, 70, 76, 255));
+		draw_clear_x(BAR_CLEAR_CX, BAR_Y + BAR_H / 2, 4,
+			     RGBA8(210, 210, 215, 255));
+	} else {
+		draw_text(tx, ty, RGBA8(140, 140, 148, 255), 0.95f,
+			  "Search your photos");
+	}
+}
+
+/* minimal UTF-8 <-> UTF-16 (BMP) for the on-screen keyboard buffers */
+static void utf8_to_utf16(const char *s, uint16_t *out, int outcap)
+{
+	int n = 0;
+	while (*s && n < outcap - 1) {
+		unsigned char c = (unsigned char)s[0];
+		unsigned int cp;
+		if (c < 0x80) {
+			cp = c; s += 1;
+		} else if ((c >> 5) == 0x6 && (s[1] & 0xC0) == 0x80) {
+			cp = ((c & 0x1F) << 6) | (s[1] & 0x3F); s += 2;
+		} else if ((c >> 4) == 0xE && (s[1] & 0xC0) == 0x80 &&
+			   (s[2] & 0xC0) == 0x80) {
+			cp = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) |
+			     (s[2] & 0x3F); s += 3;
+		} else {
+			cp = '?'; s += 1;
+		}
+		out[n++] = (uint16_t)(cp > 0xFFFF ? '?' : cp);
+	}
+	out[n] = 0;
+}
+
+static void utf16_to_utf8(const uint16_t *s, char *out, int outcap)
+{
+	int n = 0;
+	for (; *s; s++) {
+		unsigned int cp = *s;
+		if (cp < 0x80) {
+			if (n + 1 >= outcap) break;
+			out[n++] = (char)cp;
+		} else if (cp < 0x800) {
+			if (n + 2 >= outcap) break;
+			out[n++] = (char)(0xC0 | (cp >> 6));
+			out[n++] = (char)(0x80 | (cp & 0x3F));
+		} else {
+			if (n + 3 >= outcap) break;
+			out[n++] = (char)(0xE0 | (cp >> 12));
+			out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+			out[n++] = (char)(0x80 | (cp & 0x3F));
+		}
+	}
+	out[n] = '\0';
+}
+
+/* bring up the system on-screen keyboard (a common dialog). returns 1 and
+ * fills `out` (UTF-8) when the user confirms, 0 if they cancelled. blocks,
+ * driving the dialog each frame; the worker thread keeps running, which is
+ * fine since we touch no shared arrays here. */
+static int ime_input(const char *title, const char *initial,
+		     char *out, size_t outsz)
+{
+	static uint16_t title16[SCE_IME_DIALOG_MAX_TITLE_LENGTH];
+	static uint16_t init16[129];
+	static uint16_t buf16[129];
+	utf8_to_utf16(title, title16, SCE_IME_DIALOG_MAX_TITLE_LENGTH);
+	utf8_to_utf16(initial ? initial : "", init16, 129);
+	memset(buf16, 0, sizeof(buf16));
+
+	SceImeDialogParam p;
+	sceImeDialogParamInit(&p);
+	p.supportedLanguages = 0;            /* allow all installed languages */
+	p.languagesForced = 0;
+	p.type = SCE_IME_TYPE_DEFAULT;
+	p.option = SCE_IME_OPTION_NO_AUTO_CAPITALIZATION;
+	p.dialogMode = SCE_IME_DIALOG_DIALOG_MODE_WITH_CANCEL;
+	p.textBoxMode = SCE_IME_DIALOG_TEXTBOX_MODE_WITH_CLEAR;
+	p.title = title16;
+	p.maxTextLength = 128;
+	p.initialText = init16;
+	p.inputTextBuffer = buf16;
+	p.enterLabel = SCE_IME_ENTER_LABEL_SEARCH;
+
+	if (sceImeDialogInit(&p) < 0)
+		return 0;
+
+	int confirmed = 0;
+	for (;;) {
+		vita2d_start_drawing();
+		vita2d_clear_screen();
+		vita2d_end_drawing();
+		vita2d_common_dialog_update();
+		vita2d_swap_buffers();
+		sceDisplayWaitVblankStart();
+
+		if (sceImeDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED)
+			continue;
+		SceImeDialogResult res;
+		memset(&res, 0, sizeof(res));
+		sceImeDialogGetResult(&res);
+		if (res.button == SCE_IME_DIALOG_BUTTON_ENTER) {
+			utf16_to_utf8(buf16, out, (int)outsz);
+			confirmed = 1;
+		}
+		sceImeDialogTerm();
+		break;
+	}
+	return confirmed;
+}
+
+/* run an Immich smart (CLIP) search and switch the grid to its results.
+ * main thread only: it appends any newly-seen assets to the g_asset_* arrays
+ * (like fetch_page) and rebuilds g_disp from the result set. returns the
+ * number of distinct results shown (>=0), or -1 on a request/parse failure. */
+static int run_smart_search(const char *query)
+{
+	char esc[256]; /* JSON-escape the query into the request body */
+	int e = 0;
+	for (const char *p = query; *p && e < (int)sizeof(esc) - 2; p++) {
+		unsigned char c = (unsigned char)*p;
+		if (c == '"' || c == '\\') {
+			esc[e++] = '\\';
+			esc[e++] = (char)c;
+		} else if (c >= 0x20) {
+			esc[e++] = (char)c;
+		} else {
+			esc[e++] = ' ';
+		}
+	}
+	esc[e] = '\0';
+
+	char url[600];
+	snprintf(url, sizeof(url), "%s/api/search/smart", g_server);
+	char body[320];
+	snprintf(body, sizeof(body), "{\"query\":\"%s\"}", esc);
+
+	membuf buf;
+	long code;
+	CURLcode res = http_request(url, body, &buf, &code, NULL, 0);
+	if (res != CURLE_OK || code < 200 || code >= 300) {
+		log_line("smart search: curl %d http %ld: %.160s", res, code,
+			 buf.data ? buf.data : "");
+		free(buf.data);
+		return -1;
+	}
+
+	char err[160];
+	int before = g_asset_count;
+	int added = parse_assets(buf.data, buf.size, err, sizeof(err));
+	free(buf.data);
+	if (added < 0) {
+		log_line("smart search parse: %s", err);
+		return -1;
+	}
+
+	/* the freshly-parsed tail [before, count) is the result set in server
+	 * order. capture the ids before dedup compacts that tail around, then
+	 * resolve each id to its surviving index in g_asset_*. */
+	int raw = g_asset_count - before;
+	static char (*ids)[40];
+	static int ids_cap;
+	if (raw > ids_cap) {
+		void *np = realloc(ids, sizeof(ids[0]) * raw);
+		if (!np)
+			return -1;
+		ids = np;
+		ids_cap = raw;
+	}
+	for (int i = 0; i < raw; i++)
+		memcpy(ids[i], g_asset_ids[before + i], sizeof(ids[0]));
+
+	dedup_new_assets(before);
+
+	if (!(g_search_cap = GROW(g_search_idx, g_search_cap,
+				  raw > 0 ? raw : 1)))
+		return -1;
+	g_search_count = 0;
+	for (int i = 0; i < raw; i++) {
+		int idx = -1;
+		for (int j = 0; j < g_asset_count; j++)
+			if (!strcmp(g_asset_ids[j], ids[i])) {
+				idx = j;
+				break;
+			}
+		if (idx < 0)
+			continue;
+		int seen = 0;
+		for (int k = 0; k < g_search_count && !seen; k++)
+			seen = (g_search_idx[k] == idx);
+		if (!seen)
+			g_search_idx[g_search_count++] = idx;
+	}
+
+	g_search_active = 1;
+	snprintf(g_search_query, sizeof(g_search_query), "%s", query);
+	rebuild_display();
+	log_line("smart search '%s': %d result(s)", query, g_search_count);
+	return g_search_count;
 }
 
 static void draw_hud(const char *text)
@@ -3158,6 +3551,15 @@ int main(void)
 	g_font = vita2d_load_default_pgf();
 	g_ttf = vita2d_load_font_file("app0:font.ttf");
 
+	/* on-screen keyboard (smart search). the IME runs as a common dialog;
+	 * the config tells it the system language + enter/cancel button map */
+	sceSysmoduleLoadModule(SCE_SYSMODULE_IME);
+	{
+		SceCommonDialogConfigParam cfg;
+		sceCommonDialogConfigParamInit(&cfg);
+		sceCommonDialogSetConfigParam(&cfg);
+	}
+
 	/* analog mode so the left stick reports lx/ly for detail-view panning */
 	sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
 	/* front touch: drag scrolls the grid, a tap opens the item */
@@ -3271,6 +3673,7 @@ int main(void)
 	 * changes photo, drag pans when zoomed) */
 	int touch_active = 0;   /* finger currently down */
 	int touch_dragged = 0;  /* moved past the tap threshold */
+	int touch_on_bar = 0;   /* contact began on the search bar */
 	float touch_x = 0, touch_y = 0;       /* last position, screen px */
 	float touch_start_x = 0, touch_start_y = 0, touch_start_scroll = 0;
 	float touch_panx0 = 0, touch_pany0 = 0; /* pan at touch start (zoomed) */
@@ -3335,6 +3738,13 @@ int main(void)
 			nav |= pad.buttons & dirs;
 
 		if (mode == MODE_GRID) {
+			/* search bar: TRIANGLE opens the keyboard, CIRCLE (or
+			 * the bar's clear chip) drops back to the timeline. a
+			 * tap on the bar sets these too; handled after touch. */
+			int do_search_open = (pressed & SCE_CTRL_TRIANGLE) != 0;
+			int do_search_clear = g_search_active &&
+					      (pressed & SCE_CTRL_CIRCLE) != 0;
+
 			if (nav & SCE_CTRL_RIGHT)
 				sel++;
 			if (nav & SCE_CTRL_LEFT)
@@ -3354,8 +3764,9 @@ int main(void)
 					  +1 : -1;
 				/* jumping down: the next month may simply not
 				 * be fetched yet — pull pages until a new
-				 * month shows up (or the library ends) */
-				if (dir > 0) {
+				 * month shows up (or the library ends). search
+				 * results aren't paginated, so skip the pull. */
+				if (dir > 0 && !g_search_active) {
 					int guard = 0;
 					while (g_next_page > 0 && guard++ < 10 &&
 					       !strncmp(disp_date(month_jump(sel, +1)),
@@ -3367,10 +3778,10 @@ int main(void)
 					}
 				}
 				sel = month_jump(sel, dir);
-				/* put the jumped-to month at the top of the
-				 * screen, header band included */
+				/* put the jumped-to month just below the pinned
+				 * search bar, header band included */
 				if (sel >= 0 && sel < g_disp_count)
-					target = g_item_y[sel] - HEADER_H;
+					target = g_item_y[sel] - HEADER_H - SEARCH_H;
 			}
 
 			/* Track how long the selection has held still. A held
@@ -3392,7 +3803,7 @@ int main(void)
 			}
 			int scrolling_fast = (grid_settle < 12);
 
-			if (pressed & SCE_CTRL_CROSS) {
+			if ((pressed & SCE_CTRL_CROSS) && g_disp_count > 0) {
 				/* photos and videos both open the detail
 				 * view; a video shows its poster with the
 				 * play button there */
@@ -3407,7 +3818,8 @@ int main(void)
 			 * end (gated on !scrolling_fast, see above). no loading
 			 * screen: the grid stays up, the HUD's "+" already says
 			 * more is coming, and the fetch only blocks briefly */
-			if (!scrolling_fast && g_next_page > 0 &&
+			if (!scrolling_fast && !g_search_active &&
+			    g_next_page > 0 &&
 			    sel >= g_disp_count - COLS * 4) {
 				if (fetch_page(0) > 0)
 					rebuild_keep_view(&sel, &scroll,
@@ -3419,7 +3831,7 @@ int main(void)
 			 * settled, keeping the selection on the same photo
 			 * across the relayout */
 			uint64_t pnow = sceKernelGetProcessTimeWide();
-			if (!scrolling_fast && !touch_active &&
+			if (!scrolling_fast && !touch_active && !g_search_active &&
 			    pnow - last_poll > 30ULL * 1000 * 1000) {
 				last_poll = pnow;
 				if (check_new_assets() > 0)
@@ -3442,10 +3854,14 @@ int main(void)
 					if (!touch_active) {
 						touch_active = 1;
 						touch_dragged = 0;
+						touch_start_x = tx;
 						touch_start_y = ty;
 						touch_start_scroll = scroll;
 						touch_vel = 0;
-					} else {
+						/* a contact on the bar opens the
+						 * keyboard instead of scrolling */
+						touch_on_bar = (ty < (float)SEARCH_H);
+					} else if (!touch_on_bar) {
 						float dy = ty - touch_start_y;
 						if (!touch_dragged &&
 						    (dy > 14.0f || dy < -14.0f))
@@ -3460,7 +3876,8 @@ int main(void)
 							scroll = target = ns;
 							/* keep the selection inside
 							 * the dragged viewport */
-							int c = item_near(ns + SCREEN_H / 2);
+							int c = item_near(ns +
+								(SEARCH_H + SCREEN_H) / 2);
 							if (c >= 0)
 								sel = c;
 						}
@@ -3469,7 +3886,17 @@ int main(void)
 					touch_y = ty;
 				} else if (touch_active) {
 					touch_active = 0;
-					if (!touch_dragged) {
+					if (touch_on_bar) {
+						/* tap on the search bar: clear
+						 * chip while a search is on, else
+						 * open the keyboard */
+						if (g_search_active &&
+						    touch_x > BAR_CLEAR_CX - 16)
+							do_search_clear = 1;
+						else
+							do_search_open = 1;
+						touch_on_bar = 0;
+					} else if (!touch_dragged) {
 						/* tap: open the item under it
 						 * (videos show their poster +
 						 * play button in the detail) */
@@ -3494,10 +3921,67 @@ int main(void)
 							target = 0;
 						if (target > maxs)
 							target = maxs;
-						int c = item_near(target + SCREEN_H / 2);
+						int c = item_near(target +
+							(SEARCH_H + SCREEN_H) / 2);
 						if (c >= 0)
 							sel = c;
 					}
+				}
+
+				/* act on a search request from TRIANGLE/CIRCLE
+				 * or a tap on the bar. both block this frame
+				 * (keyboard / request), so restart the loop. */
+				if (do_search_clear) {
+					g_search_active = 0;
+					g_search_query[0] = '\0';
+					rebuild_display();
+					sel = 0;
+					scroll = target = 0;
+					detail_idx = -1;
+					grid_last_sel = -1;
+					for (int k = 0; k < 2; k++) {
+						if (pf_tex[k]) {
+							vita2d_wait_rendering_done();
+							vita2d_free_texture(pf_tex[k]);
+							pf_tex[k] = NULL;
+						}
+						pf_d[k] = -1;
+					}
+					continue;
+				}
+				if (do_search_open) {
+					char q[128] = "";
+					int ok = ime_input("Search your photos",
+						g_search_active ? g_search_query : "",
+						q, sizeof(q));
+					if (ok && q[0]) {
+						show_status("Searching \"%s\"...", q);
+						int nres = run_smart_search(q);
+						if (nres >= 0) {
+							sel = 0;
+							scroll = target = 0;
+							detail_idx = -1;
+							grid_last_sel = -1;
+							for (int k = 0; k < 2; k++) {
+								if (pf_tex[k]) {
+									vita2d_wait_rendering_done();
+									vita2d_free_texture(pf_tex[k]);
+									pf_tex[k] = NULL;
+								}
+								pf_d[k] = -1;
+							}
+						} else {
+							show_blocking_error(
+								"Search failed",
+								"Smart search may be "
+								"disabled on the server "
+								"(see log.txt).");
+						}
+					}
+					/* swallow buttons held during the dialog */
+					prev_buttons = 0xFFFFFFFF;
+					touch_active = touch_on_bar = 0;
+					continue;
 				}
 			}
 
@@ -3506,8 +3990,9 @@ int main(void)
 			 * moving up, reveal the header band above the item. */
 			float sel_y = (sel >= 0 && sel < g_disp_count) ?
 				      g_item_y[sel] : 0.0f;
-			if (sel_y - HEADER_H < target)
-				target = sel_y - HEADER_H;
+			/* reveal the header band below the pinned search bar */
+			if (sel_y - HEADER_H - SEARCH_H < target)
+				target = sel_y - HEADER_H - SEARCH_H;
 			float sel_h = (sel >= 0 && sel < g_disp_count) ?
 				      g_item_h[sel] : ROW_H;
 			if (sel_y + sel_h > target + SCREEN_H)
@@ -3638,11 +4123,28 @@ int main(void)
 							 g_item_h[i] - 4);
 			}
 
-			char hud[160];
-			snprintf(hud, sizeof(hud),
-				 "%d / %d%s    %.10s    X view  SELECT sync  START exit",
-				 sel + 1, g_disp_count, g_next_page > 0 ? "+" : "",
-				 g_disp_count > 0 ? disp_date(sel) : "");
+			if (g_search_active && g_disp_count == 0)
+				draw_centered(SCREEN_H / 2,
+					      RGBA8(160, 160, 165, 255),
+					      "No results");
+
+			/* pinned Immich-style search bar, on top of the grid */
+			draw_search_bar();
+
+			char hud[200];
+			if (g_search_active)
+				snprintf(hud, sizeof(hud),
+					 "%d / %d results    /\\ edit  O clear  "
+					 "X view  START exit",
+					 g_disp_count > 0 ? sel + 1 : 0,
+					 g_disp_count);
+			else
+				snprintf(hud, sizeof(hud),
+					 "%d / %d%s   %.10s   X view  /\\ search  "
+					 "SELECT sync  START exit",
+					 sel + 1, g_disp_count,
+					 g_next_page > 0 ? "+" : "",
+					 g_disp_count > 0 ? disp_date(sel) : "");
 			draw_hud(hud);
 
 			vita2d_end_drawing();
