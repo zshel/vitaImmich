@@ -68,18 +68,29 @@ tool works there. (Connecting to the live desktop with `session_connect` does
 the only reliable way to capture, and it is headless: the human cannot watch it
 live on their monitor.)
 
-- `session_start` with `app_command: "vita3k -r VIMM00001"` **and
-  `keep_screenshots: true`** — starts an isolated Wayland session, launches the
-  app, and keeps every captured frame on disk after `session_stop`. Give it ~12s
-  to boot.
+- **Before starting, wipe the per-session frame folder** so each run is clean:
+  `rm -rf agent-run/frames && mkdir -p agent-run/frames`. (`agent-run/` is
+  git-ignored; `frames/` is the throwaway capture folder — keepers live in
+  `agent-run/` proper and are never touched.)
+- `session_start` with `app_command: "vita3k -r VIMM00001"`,
+  `keep_screenshots: true`, **and `env: {"SDL_VIDEODRIVER": "wayland", "DISPLAY":
+  ""}`** — starts an isolated Wayland session, launches the app, and keeps every
+  captured frame on disk after `session_stop`. Without that `env` the frames come
+  back blank white and input is dropped (host `DISPLAY=:1` sends SDL to X11). Give
+  it ~12s to boot.
 - **`focus_window` with `app_name: "Vita3K"` BEFORE sending keys.** Without focus
   the keypresses are dropped. Presses also drop intermittently — re-focus and
   re-press. Send one key per call; rapid bursts get coalesced/dropped.
 - `keyboard_key` with `screenshot_after_ms: [ms]` after **every** command, so the
   frame folder is a complete visual record of the run for the human to scrub.
-- `session_stop` when done (and `pkill -9 -f vita3k`). Frames survive in
-  `/tmp/kwin-mcp-screenshots-*/`; copy them to `./agent-run/` (git-ignored) and
-  tell the human where they are.
+- `session_stop` when done (and `pkill -9 -f vita3k`). kwin-mcp always writes
+  frames to `/tmp/kwin-mcp-screenshots-*/` (that path is not configurable); don't
+  leave them there — **move them into the repo and clear the tmp folder**:
+  ```bash
+  cp /tmp/kwin-mcp-screenshots-*/*.png agent-run/frames/ 2>/dev/null
+  rm -rf /tmp/kwin-mcp-screenshots-*
+  ```
+  Then tell the human the frames are in `agent-run/frames/`.
 
 ### Zero-context-cost capture (the standing rule)
 
@@ -110,7 +121,8 @@ Vita3K maps host keys → Vita buttons. The ones this app uses:
 
 ### Typical verify loop (capture everything, Read nothing)
 
-1. `session_start` (`keep_screenshots: true`) → wait ~12s.
+1. `rm -rf agent-run/frames && mkdir -p agent-run/frames`, then `session_start`
+   (`keep_screenshots: true`, `env` forcing Wayland) → wait ~12s.
 2. `focus_window "Vita3K"`.
 3. `keyboard_key "Right"` (with `screenshot_after_ms`) … stepping to the target
    tile, one key per call.
@@ -119,6 +131,6 @@ Vita3K maps host keys → Vita buttons. The ones this app uses:
    - `~/.local/share/Vita3K/Vita3K/ux0/data/vitaimmich/log.txt` (the app's own log
      — records page fetches, video open/play, scans, errors)
    - MCP `read_app_log` with the launched PID, or `/tmp/vita3k-runtime.log`.
-6. On `session_stop`, the captured frames remain in
-   `/tmp/kwin-mcp-screenshots-*/` — hand that folder (or a copy in `./agent-run/`)
-   to the human as the visual record.
+6. On `session_stop`, move the frames out of `/tmp` and clear it:
+   `cp /tmp/kwin-mcp-screenshots-*/*.png agent-run/frames/ 2>/dev/null && rm -rf /tmp/kwin-mcp-screenshots-*`.
+   Hand `agent-run/frames/` to the human as the visual record.
