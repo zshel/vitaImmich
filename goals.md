@@ -2,6 +2,21 @@
 
 Task list for the current round of work. Checked items are done.
 
+## -1. UI polish round 2 (current)
+- [x] Reload images taken by the camera while the app was asleep: detect
+      resume via an RTC wall-clock jump (>3 s) and append-only re-scan the
+      camera folders (headroom reserved at startup so no realloc races the
+      worker/sync threads).
+- [x] Pressing up on the d-pad (from the top row) focuses the search bar
+      (indigo ring); down returns to the grid, X opens the keyboard.
+- [x] Immich logo (bundled app0:logo.png, white bg made transparent) to the
+      left of the search bar.
+- [x] "Made by SadsArches with love" credit on the cloud menu.
+- [x] Spinning Immich logo on the startup loading screen (first page fetched
+      on a thread so the logo actually spins), loading text below.
+- [x] Anti-alias the video play overlay (AA disc + baked play-triangle glyph).
+- [x] O (back) circle button top-right in the detail view (tappable + O).
+
 ## 0. UI polish (current round)
 - [x] Hide the white selection square while touch-scrolling; show it again
       when the selection moves with the d-pad.

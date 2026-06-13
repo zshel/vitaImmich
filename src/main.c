@@ -104,6 +104,7 @@ int BZ2_bzDecompressEnd(void *strm) { return -1; }
 
 static vita2d_pgf *g_font;           /* system font, fallback */
 static vita2d_font *g_ttf;           /* bundled Overpass (Immich's face) */
+static vita2d_texture *g_logo;       /* bundled Immich logo (app0:logo.png) */
 
 /* server-asset arrays. dynamically grown (doubling) as pages are fetched, so
  * the library is bounded only by memory, not a fixed cap. grown on the main
@@ -389,6 +390,26 @@ static void draw_centered(int y, uint32_t color, const char *text)
 {
 	int w = text_width(1.0f, text);
 	draw_text((SCREEN_W - w) / 2, y, color, 1.0f, text);
+}
+
+/* startup loading screen: the Immich logo spinning, with text below it */
+static void draw_loading(const char *text, unsigned int frame)
+{
+	vita2d_start_drawing();
+	vita2d_clear_screen();
+	float cx = SCREEN_W / 2.0f, cy = SCREEN_H / 2.0f - 30.0f;
+	if (g_logo) {
+		float lw = vita2d_texture_get_width(g_logo);
+		float lh = vita2d_texture_get_height(g_logo);
+		float scale = 110.0f / lw;
+		vita2d_draw_texture_scale_rotate_hotspot(g_logo, cx, cy,
+			scale, scale, frame * 0.10f, lw / 2.0f, lh / 2.0f);
+	}
+	int w = text_width(1.0f, text);
+	draw_text((SCREEN_W - w) / 2, cy + 90.0f,
+		  RGBA8(225, 225, 230, 255), 1.0f, text);
+	vita2d_end_drawing();
+	vita2d_swap_buffers();
 }
 
 static void show_status(const char *fmt, ...)
@@ -1957,7 +1978,7 @@ static void draw_sel_outline(float x, float y, float w, float h)
  * texture's bilinear sampling are what soften the corners. */
 static vita2d_texture *rounded_mask_tex(int w, int h, float r)
 {
-	enum { NSLOT = 6 };  /* a small fixed set of shapes (pill, buttons, ...) */
+	enum { NSLOT = 8 };  /* a small fixed set of shapes (pill, buttons, ...) */
 	static vita2d_texture *cache[NSLOT];
 	static int cw[NSLOT], ch[NSLOT];
 	static float cr[NSLOT];
@@ -2141,12 +2162,19 @@ static int cov_circle(float px, float py, int s)
 	return d <= R && d >= R - W;
 }
 
+/* a filled right-pointing play triangle */
+static int cov_play(float px, float py, int s)
+{
+	return in_tri(px, py, s * 0.36f, s * 0.27f,
+		      s * 0.36f, s * 0.73f, s * 0.76f, s * 0.5f);
+}
+
 /* cache one texture per glyph; all are drawn at a fixed size each frame */
 static vita2d_texture *icon_tex(int which, int s)
 {
-	static vita2d_texture *cache[7];
-	static int cs[7];
-	if (which < 0 || which > 6)
+	static vita2d_texture *cache[8];
+	static int cs[8];
+	if (which < 0 || which > 7)
 		return NULL;
 	if (cache[which] && cs[which] == s)
 		return cache[which];
@@ -2160,7 +2188,8 @@ static vita2d_texture *icon_tex(int which, int s)
 				       which == 2 ? cov_cloud :
 				       which == 3 ? cov_tri :
 				       which == 4 ? cov_sq :
-				       which == 5 ? cov_cross : cov_circle;
+				       which == 5 ? cov_cross :
+				       which == 6 ? cov_circle : cov_play;
 	cache[which] = bake_icon(s, fn);
 	cs[which] = s;
 	return cache[which];
@@ -2172,6 +2201,7 @@ static vita2d_texture *icon_tex(int which, int s)
 #define ICON_SQUARE 4
 #define ICON_CROSS  5
 #define ICON_CIRCLE 6
+#define ICON_PLAY   7
 
 /* a DualShock-style face button: a dark disc (subtle lighter rim) centred at
  * (cx,cy) with the coloured glyph on top. each glyph keeps a per-call size. */
@@ -2244,8 +2274,9 @@ static void draw_ps_button(float cx, float cy, float d, int icon,
 #define BTN2_CX ((float)SCREEN_W - BAR_M - BTN_SZ / 2)   /* cloud (rightmost) */
 #define BTN1_CX (BTN2_CX - BTN_SZ - BTN_GAP)             /* map */
 #define BTN_CY  (BAR_Y + BAR_H / 2)
-#define BAR_W  (BTN1_CX - BTN_SZ / 2 - BTN_GAP - BAR_M)  /* pill width */
-#define BAR_CLEAR_CX (BAR_M + BAR_W - 22.0f) /* centre of the clear chip */
+#define BAR_PX  (BAR_M + 42.0f)            /* pill left x (logo to its left) */
+#define BAR_W  (BTN1_CX - BTN_SZ / 2 - BTN_GAP - BAR_PX)  /* pill width */
+#define BAR_CLEAR_CX (BAR_PX + BAR_W - 22.0f) /* centre of the clear chip */
 
 /* one future-feature button: rounded-square background + a centred AA glyph */
 static void draw_bar_button(float cx, float cy, int icon)
@@ -2261,32 +2292,55 @@ static void draw_bar_button(float cx, float cy, int icon)
 					 RGBA8(190, 190, 196, 255));
 }
 
-/* draw the bar shifted vertically by `yoff` (Square slides it out of view) */
-static void draw_search_bar(float yoff)
+/* draw the bar shifted vertically by `yoff` (Square slides it out of view);
+ * `focus` highlights the focused element (1=field, 2=map, 3=cloud) */
+static void draw_search_bar(float yoff, int focus)
 {
 	unsigned int field = RGBA8(38, 38, 42, 255);
+	unsigned int hi = RGBA8(94, 110, 215, 255);   /* focus ring (indigo) */
 	float by = BAR_Y + yoff, cy = BTN_CY + yoff;
 	/* opaque strip so grid items scroll cleanly underneath the bar */
 	vita2d_draw_rectangle(0, yoff, SCREEN_W, SEARCH_H, RGBA8(16, 16, 16, 255));
+	/* Immich logo to the left of the search field */
+	if (g_logo) {
+		float ls = (BAR_H - 6.0f) / vita2d_texture_get_width(g_logo);
+		vita2d_draw_texture_scale(g_logo, BAR_M, by + 3.0f, ls, ls);
+	}
+	/* focus ring behind the field */
+	if (focus == 1) {
+		vita2d_texture *ring = rounded_mask_tex((int)BAR_W + 6,
+							(int)BAR_H + 6, BAR_R + 3);
+		if (ring)
+			vita2d_draw_texture_tint(ring, BAR_PX - 3, by - 3, hi);
+	}
 	/* borderless field: an AA rounded-rect mask tinted to the field colour */
 	vita2d_texture *mask = rounded_mask_tex((int)BAR_W, (int)BAR_H, BAR_R);
 	if (mask)
-		vita2d_draw_texture_tint(mask, BAR_M, by, field);
+		vita2d_draw_texture_tint(mask, BAR_PX, by, field);
 	else
-		vita2d_draw_rectangle(BAR_M, by, BAR_W, BAR_H, field);
+		vita2d_draw_rectangle(BAR_PX, by, BAR_W, BAR_H, field);
 
 	int isz = 24;
 	vita2d_texture *icon = icon_tex(ICON_SEARCH, isz);
 	if (icon)
-		vita2d_draw_texture_tint(icon, BAR_M + 22 - isz / 2.0f,
+		vita2d_draw_texture_tint(icon, BAR_PX + 22 - isz / 2.0f,
 					 cy - isz / 2.0f,
 					 RGBA8(190, 190, 196, 255));
 
+	/* focus rings behind the placeholder buttons */
+	if (focus == 2 || focus == 3) {
+		vita2d_texture *r = rounded_mask_tex((int)BTN_SZ + 6,
+						     (int)BTN_SZ + 6, 14.0f);
+		float fcx = (focus == 2) ? BTN1_CX : BTN2_CX;
+		if (r)
+			vita2d_draw_texture_tint(r, fcx - (BTN_SZ + 6) / 2,
+						 cy - (BTN_SZ + 6) / 2, hi);
+	}
 	/* placeholder buttons (map, cloud) for future features */
 	draw_bar_button(BTN1_CX, cy, ICON_MAP);
 	draw_bar_button(BTN2_CX, cy, ICON_CLOUD);
 
-	float tx = BAR_M + 44, ty = by + BAR_H - 13;
+	float tx = BAR_PX + 44, ty = by + BAR_H - 13;
 	if (g_search_active && g_search_query[0]) {
 		char q[64];
 		snprintf(q, sizeof(q), "%.40s", g_search_query);
@@ -2521,20 +2575,16 @@ static void draw_throbber(float cx, float cy, float r, unsigned int frame)
 	}
 }
 
-/* translucent play button over a video's poster in the detail view */
+/* translucent play button over a video's poster in the detail view (AA) */
 static void draw_play_overlay(void)
 {
 	float cx = SCREEN_W / 2.0f, cy = SCREEN_H / 2.0f;
-	vita2d_draw_fill_circle(cx, cy, 46.0f, RGBA8(20, 20, 20, 150));
-	vita2d_color_vertex *v =
-		vita2d_pool_memalign(3 * sizeof(*v), sizeof(*v));
-	if (!v)
-		return;
-	unsigned int col = RGBA8(255, 255, 255, 220);
-	v[0] = (vita2d_color_vertex){ cx - 14.0f, cy - 24.0f, 0.5f, col };
-	v[1] = (vita2d_color_vertex){ cx - 14.0f, cy + 24.0f, 0.5f, col };
-	v[2] = (vita2d_color_vertex){ cx + 28.0f, cy, 0.5f, col };
-	vita2d_draw_array(SCE_GXM_PRIMITIVE_TRIANGLES, v, 3);
+	draw_disc(cx, cy, 92.0f, RGBA8(20, 20, 20, 150));
+	int gs = 56;
+	vita2d_texture *p = icon_tex(ICON_PLAY, gs);
+	if (p)
+		vita2d_draw_texture_tint(p, cx - gs / 2.0f, cy - gs / 2.0f,
+					 RGBA8(255, 255, 255, 235));
 }
 
 static void draw_error_detail(int idx)
@@ -3281,6 +3331,11 @@ static int is_media_name(const char *name, int *is_video)
 	return 0;
 }
 
+/* set while re-scanning after a resume from sleep: scan_dir then only appends
+ * genuinely-new files into the headroom (no realloc; the worker/sync threads
+ * are reading the arrays) */
+static int g_rescan;
+
 /* recurse a directory (up to depth levels) collecting camera media */
 static void scan_dir(const char *path, int depth)
 {
@@ -3328,12 +3383,26 @@ static void scan_dir(const char *path, int depth)
 			continue;
 		}
 
-		if (!grow_locals(g_local_count + 1)) {
+		/* rescan (resume from sleep): skip files we already know, and
+		 * never realloc while the sync/worker threads are reading the
+		 * arrays — only fill into the headroom reserved at startup */
+		if (g_rescan) {
+			int known = 0;
+			for (int k = 0; k < g_local_count && !known; k++)
+				known = !strcmp(g_local_path[k], full);
+			if (known)
+				continue;
+			if (g_local_count >= g_local_cap) {
+				log_line("rescan: no headroom at %d files",
+					 g_local_count);
+				break;
+			}
+		} else if (!grow_locals(g_local_count + 1)) {
 			log_line("scan: out of memory at %d local files",
 				 g_local_count);
 			break;
 		}
-		int j = g_local_count++;
+		int j = g_local_count;   /* fill, then publish (count++) */
 		memcpy(g_local_path[j], full, pl + 1 + nl + 1);
 		g_local_is_video[j] = is_video;
 		g_local_size[j] = (long long)ent.d_stat.st_size;
@@ -3345,6 +3414,8 @@ static void scan_dir(const char *path, int depth)
 		g_local_server_id[j][0] = '\0';
 		g_local_err[j][0] = '\0';
 		g_local_state[j] = SYNC_UNSCANNED;
+		__sync_synchronize();
+		g_local_count = j + 1;
 	}
 	sceIoDclose(dfd);
 	log_line("scan: %s: %d media so far", path, g_local_count);
@@ -3372,6 +3443,27 @@ static void scan_local_media(void)
 		scan_dir("ux0:video/CAMERA", 3);
 	}
 	log_line("local scan: %d files", g_local_count);
+}
+
+/* append-only re-scan of the camera folders (resume from sleep). same dirs as
+ * scan_local_media, but g_rescan keeps it from touching known entries or
+ * reallocating. returns how many new files were appended. */
+static int rescan_local_new(void)
+{
+	int before = g_local_count;
+	g_rescan = 1;
+	if (g_syncdir_count > 0) {
+		for (int i = 0; i < g_syncdir_count; i++)
+			scan_dir(g_syncdirs[i], 3);
+	} else {
+		scan_dir(g_photo0_mounted ? "photo0:" : "ux0:picture", 3);
+		scan_dir("ux0:video/CAMERA", 3);
+	}
+	g_rescan = 0;
+	int added = g_local_count - before;
+	if (added > 0)
+		log_line("rescan: %d new local file(s) after resume", added);
+	return added;
 }
 
 static int sha1_file_hex(const char *path, char out[41])
@@ -3830,12 +3922,25 @@ static int count_state(int st)
 
 enum { MODE_GRID, MODE_DETAIL, MODE_CLOUD, MODE_CLOUD_DETAILS };
 
+/* the first library page is fetched on this thread so the main thread can
+ * spin the loading logo while it waits */
+static volatile int g_init_load_done;
+static int init_load_thread(SceSize args, void *argp)
+{
+	(void)args; (void)argp;
+	fetch_page(0);
+	__sync_synchronize();
+	g_init_load_done = 1;
+	return 0;
+}
+
 int main(void)
 {
 	vita2d_init();
 	vita2d_set_clear_color(RGBA8(16, 16, 16, 255));
 	g_font = vita2d_load_default_pgf();
 	g_ttf = vita2d_load_font_file("app0:font.ttf");
+	g_logo = vita2d_load_PNG_file("app0:logo.png");
 
 	/* on-screen keyboard (smart search). the IME runs as a common dialog;
 	 * the config tells it the system language + enter/cancel button map */
@@ -3915,10 +4020,22 @@ int main(void)
 		log_line("server='%s' len=%d hex=%s", g_server, n, hex);
 	}
 
-	show_status("Loading library from %s ...", g_server);
-	fetch_page(1);
+	/* spinning-logo loading screen while the first page loads on a thread */
+	g_init_load_done = 0;
+	SceUID lt = sceKernelCreateThread("init_load", init_load_thread,
+					  0x10000100, 256 * 1024, 0, 0, NULL);
+	if (lt >= 0) {
+		sceKernelStartThread(lt, 0, NULL);
+		unsigned int lf = 0;
+		while (!g_init_load_done) {
+			draw_loading("Loading your library...", lf++);
+			sceDisplayWaitVblankStart();
+		}
+	} else {
+		fetch_page(1);   /* fallback: blocking, no spinner */
+	}
 	if (g_asset_count == 0)
-		fatal_error(NULL, "Server returned no assets");
+		fatal_error(NULL, "Server returned no assets (see log.txt)");
 
 	SceUID worker = sceKernelCreateThread("thumb_loader", worker_thread,
 					      0x10000100, 256 * 1024, 0, 0, NULL);
@@ -3927,8 +4044,11 @@ int main(void)
 
 	/* scan the Vita's own camera media (fast: paths + stat only), build
 	 * the merged timeline, then let the sync thread hash + dup-check it */
-	show_status("Scanning local media...");
+	draw_loading("Scanning local media...", 0);
 	scan_local_media();
+	/* reserve headroom so a resume-from-sleep rescan can append new camera
+	 * files without reallocating while the worker/sync threads read */
+	grow_locals(g_local_count + 512);
 	rebuild_display();
 
 	SceUID syncw = sceKernelCreateThread("sync_worker", sync_thread,
@@ -3944,6 +4064,8 @@ int main(void)
 	int show_sel = 1;       /* selection square: shown for d-pad, hidden for touch */
 	int bar_shown = 1;      /* top search bar visible */
 	float bar_hidden = 0.0f;/* animated pixels the bar is slid up (0..SEARCH_H) */
+	int bar_focus = 0;      /* search bar focused (d-pad up from the top row) */
+	uint64_t last_tick = 0; /* wall-clock (incl. sleep) to detect resume */
 	/* periodic check for photos added to the server while we run */
 	uint64_t last_poll = sceKernelGetProcessTimeWide();
 	int grid_last_sel = -1;   /* sel at the previous frame */
@@ -3991,6 +4113,22 @@ int main(void)
 		prev_buttons = pad.buttons;
 
 		frame++;
+
+		/* resume from sleep: wall-clock (RTC) keeps running while the
+		 * Vita is suspended, so a big jump between frames means we just
+		 * woke — re-scan the camera folders for photos taken meanwhile */
+		{
+			SceRtcTick rt;
+			if (sceRtcGetCurrentTick(&rt) == 0) {
+				if (last_tick &&
+				    rt.tick - last_tick > 3000000ULL) {
+					if (rescan_local_new() > 0)
+						rebuild_keep_view(&sel, &scroll,
+								  &target);
+				}
+				last_tick = rt.tick;
+			}
+		}
 
 		/* auto-backup: while enabled, queue any newly-found local-only
 		 * photos for upload (~1/s; the sync thread drains the queue).
@@ -4042,18 +4180,42 @@ int main(void)
 					      (pressed & SCE_CTRL_CIRCLE) != 0;
 			int do_open_cloud = 0; /* tap on the cloud button */
 
-			/* SQUARE slides the top bar in/out; animate the offset */
-			if (pressed & SCE_CTRL_SQUARE)
+			/* SQUARE slides the top bar in/out (when not focused);
+			 * while focused it drops focus back to the grid */
+			if ((pressed & SCE_CTRL_SQUARE) && !bar_focus)
 				bar_shown = !bar_shown;
 			float bar_t = bar_shown ? 0.0f : (float)SEARCH_H;
 			bar_hidden += (bar_t - bar_hidden) * 0.3f;
 			if (fabsf(bar_t - bar_hidden) < 0.5f)
 				bar_hidden = bar_t;
-			/* the d-pad (and month jumps) bring the selection square
-			 * back; a touch drag hides it again (set below) */
-			if (nav & dirs)
+			/* the d-pad brings the selection square back — but not
+			 * while the bar is focused; a touch drag hides it again */
+			if ((nav & dirs) && !bar_focus)
 				show_sel = 1;
 
+			if (bar_focus) {
+				/* bar focused (1=field, 2=map, 3=cloud): left/right
+				 * move across the elements, down or [] returns to
+				 * the grid, X activates the focused element */
+				show_sel = 0;
+				if ((pressed & SCE_CTRL_SQUARE) ||
+				    (nav & SCE_CTRL_DOWN)) {
+					bar_focus = 0;
+					show_sel = 1;
+				} else {
+					if ((nav & SCE_CTRL_LEFT) && bar_focus > 1)
+						bar_focus--;
+					if ((nav & SCE_CTRL_RIGHT) && bar_focus < 3)
+						bar_focus++;
+					if (pressed & SCE_CTRL_CROSS) {
+						if (bar_focus == 1)
+							do_search_open = 1;
+						else if (bar_focus == 3)
+							do_open_cloud = 1;
+						/* map (2): placeholder, no-op */
+					}
+				}
+			} else {
 			if (nav & SCE_CTRL_RIGHT)
 				sel++;
 			if (nav & SCE_CTRL_LEFT)
@@ -4064,8 +4226,16 @@ int main(void)
 				sel = g_disp_count - 1;
 			if (nav & SCE_CTRL_DOWN)
 				sel = nav_row(sel, +1);
-			if (nav & SCE_CTRL_UP)
-				sel = nav_row(sel, -1);
+			if (nav & SCE_CTRL_UP) {
+				int nr = nav_row(sel, -1);
+				if (nr == sel) {        /* already on the top row */
+					bar_focus = 1;
+					bar_shown = 1;  /* reveal the bar if hidden */
+					show_sel = 0;
+				} else {
+					sel = nr;
+				}
+			}
 			if ((pressed & (SCE_CTRL_RTRIGGER |
 					SCE_CTRL_LTRIGGER)) &&
 			    g_disp_count > 0) {
@@ -4092,6 +4262,7 @@ int main(void)
 				if (sel >= 0 && sel < g_disp_count)
 					target = g_item_y[sel] - HEADER_H - SEARCH_H;
 			}
+			}  /* end !bar_focus */
 
 			/* Track how long the selection has held still. A held
 			 * d-pad auto-repeats one row every few frames; while it's
@@ -4112,7 +4283,8 @@ int main(void)
 			}
 			int scrolling_fast = (grid_settle < 12);
 
-			if ((pressed & SCE_CTRL_CROSS) && g_disp_count > 0) {
+			if ((pressed & SCE_CTRL_CROSS) && g_disp_count > 0 &&
+			    !bar_focus) {
 				/* photos and videos both open the detail
 				 * view; a video shows its poster with the
 				 * play button there */
@@ -4167,6 +4339,7 @@ int main(void)
 						touch_start_y = ty;
 						touch_start_scroll = scroll;
 						touch_vel = 0;
+						bar_focus = 0;  /* touching cancels bar focus */
 						/* a contact on the (visible) bar opens
 						 * the keyboard instead of scrolling */
 						touch_on_bar =
@@ -4209,7 +4382,7 @@ int main(void)
 							/* cloud button: open the
 							 * server/backup page */
 							do_open_cloud = 1;
-						} else if (touch_x > BAR_M + BAR_W) {
+						} else if (touch_x > BAR_PX + BAR_W) {
 							/* map button (placeholder) */
 						} else if (g_search_active &&
 						    touch_x > BAR_CLEAR_CX - 16)
@@ -4460,7 +4633,7 @@ int main(void)
 
 			/* pinned Immich-style search bar, slid up by bar_hidden
 			 * (Square toggles it); covers items up to its lower edge */
-			draw_search_bar(-bar_hidden);
+			draw_search_bar(-bar_hidden, bar_focus);
 
 			char hud[200];
 			if (g_search_active)
@@ -4910,10 +5083,8 @@ pf_skip:
 					 g_disp_count > 0 ? disp_date(sel) : "",
 					 xhint);
 			draw_hud(hud);
-			/* ...and a discreet corner throbber while the
-			 * full-res image is still on its way — but only when
-			 * a preview is showing; with no preview at all the
-			 * big centered throbber is already up */
+			/* discreet corner throbber while the full-res image loads,
+			 * only when a preview is showing */
 			if (detail_loading && disp_thumb(sel))
 				draw_throbber(SCREEN_W - 36.0f, 36.0f,
 					      14.0f, frame);
@@ -5119,12 +5290,32 @@ pf_skip:
 			draw_ps_button(ubx - 23, bty + bth / 2, 38, ICON_TRI,
 				       RGBA8(95, 205, 130, 255), 28);
 
+			draw_centered(SCREEN_H - 56, RGBA8(150, 150, 158, 255),
+				      "Made by SadsArches with love");
 			draw_hud("X / tap details    O back");
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
 		} else if (mode == MODE_CLOUD_DETAILS) {
 			/* scrollable list of not-backed-up local files + status */
-			if (pressed & SCE_CTRL_CIRCLE) {
+			float bkd = 36, bkcx = SCREEN_W - 30, bkcy = 36;
+			int do_back = (pressed & SCE_CTRL_CIRCLE) != 0;
+			/* touch: tap the top-right Back button */
+			{
+				SceTouchData td;
+				sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
+				if (td.reportNum > 0) {
+					float tx = td.report[0].x * 0.5f;
+					float ty = td.report[0].y * 0.5f;
+					if (!touch_active) {
+						touch_active = 1;
+						if (ty < bkcy + bkd && tx > bkcx - bkd)
+							do_back = 1;
+					}
+				} else {
+					touch_active = 0;
+				}
+			}
+			if (do_back) {
 				mode = MODE_CLOUD;
 				continue;
 			}
@@ -5184,6 +5375,10 @@ pf_skip:
 				draw_centered(SCREEN_H / 2,
 					      RGBA8(120, 200, 120, 255),
 					      "Everything is backed up");
+
+			/* top-right Back button (also press O) */
+			draw_ps_button(bkcx, bkcy, bkd, ICON_CIRCLE,
+				       RGBA8(235, 90, 85, 255), 26);
 
 			draw_hud("Up/Down scroll    O back");
 			vita2d_end_drawing();
