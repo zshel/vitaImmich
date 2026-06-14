@@ -9,7 +9,7 @@
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
-enum { MODE_GRID, MODE_DETAIL, MODE_CLOUD, MODE_CLOUD_DETAILS };
+enum { MODE_GRID, MODE_DETAIL, MODE_CLOUD, MODE_CLOUD_DETAILS, MODE_MAP };
 
 /* the whole boot workload (auto sign-in, first library page, local media scan)
  * runs on this one thread so the main thread can animate a single, continuous
@@ -53,6 +53,17 @@ static int srvinfo_thread(SceSize args, void *argp)
 {
 	(void)args; (void)argp;
 	fetch_server_info();
+	return 0;
+}
+
+/* fetch the map's geotagged markers off the main thread, so the map page
+ * can animate a throbber while the request is in flight (fetch_map_markers
+ * sets g_map_state to 1/-1 when it finishes) */
+static int mapfetch_thread(SceSize args, void *argp)
+{
+	(void)args; (void)argp;
+	fetch_map_markers();
+	g_map_fetching = 0;
 	return 0;
 }
 
@@ -103,6 +114,9 @@ static void reset_for_account_change(void)
 	g_search_count = 0;
 	g_srv_state = 0;   /* re-fetch the cloud page's server info */
 	g_srv_fetching = 0;
+	g_map_state = 0;   /* re-fetch the new account's map markers */
+	g_map_fetching = 0;
+	g_map_view_init = 0;
 	__sync_synchronize();
 
 	/* reload from the new account (sync still paused), then resume */
@@ -115,7 +129,10 @@ static void reset_for_account_change(void)
 
 int main(void)
 {
-	vita2d_init();
+	/* a larger vertex pool than the 1 MB default: the places map draws the
+	 * whole world as filled vector triangles in one vita2d_draw_array call,
+	 * which can be ~100k vertices when fully zoomed out */
+	vita2d_init_advanced(8 * 1024 * 1024);
 	vita2d_set_clear_color(RGBA8(16, 16, 16, 255));
 	g_font = vita2d_load_default_pgf();
 	g_ttf = vita2d_load_font_file("app0:font.ttf");
@@ -123,6 +140,7 @@ int main(void)
 	g_ic_server = vita2d_load_PNG_file("app0:cloud_server.png");
 	g_ic_device = vita2d_load_PNG_file("app0:cloud_device.png");
 	g_ic_both   = vita2d_load_PNG_file("app0:cloud_both.png");
+	load_maptiles();    /* raster LOD tile pyramid for the places map */
 	/* linear (bilinear) sampling so these scale/rotate smoothly instead of
 	 * showing jagged stair-stepped edges (point sampling is the default) */
 	vita2d_texture *icons[] = { g_logo, g_ic_server, g_ic_device, g_ic_both };
@@ -277,6 +295,7 @@ int main(void)
 	vita2d_texture *detail_tex = NULL;
 	int detail_idx = -1;
 	int detail_failed = 0;
+	int detail_from_map = 0; /* opened from the places map: O returns there */
 	int detail_loading = 0;  /* full-res load in flight on the worker */
 	int detail_issued = 0;   /* the worker request has been handed over */
 	float zoom = 1.0f, panx = 0.0f, pany = 0.0f;
@@ -290,6 +309,7 @@ int main(void)
 	float touch_start_x = 0, touch_start_y = 0, touch_start_scroll = 0;
 	float touch_panx0 = 0, touch_pany0 = 0; /* pan at touch start (zoomed) */
 	float touch_vel = 0;    /* px/frame at the moment of release */
+	float map_pinch = 0;    /* finger spread last frame (map zoom) */
 
 	/* detail-view photo slide: the current photo's horizontal offset.
 	 * a swipe maps it 1:1 to the finger; on release (or d-pad browse) it
@@ -378,6 +398,7 @@ int main(void)
 			int do_search_clear = g_search_active &&
 					      (pressed & SCE_CTRL_CIRCLE) != 0;
 			int do_open_cloud = 0; /* tap on the cloud button */
+			int do_open_map = 0;   /* tap on the map button */
 
 			/* SQUARE slides the top bar in/out (when not focused);
 			 * while focused it drops focus back to the grid */
@@ -413,9 +434,10 @@ int main(void)
 					if (pressed & SCE_CTRL_CROSS) {
 						if (bar_focus == 1)
 							do_search_open = 1;
+						else if (bar_focus == 2)
+							do_open_map = 1;
 						else if (bar_focus == 3)
 							do_open_cloud = 1;
-						/* map (2): placeholder, no-op */
 					}
 				}
 			} else {
@@ -506,6 +528,7 @@ int main(void)
 				 * view; a video shows its poster with the
 				 * play button there */
 				mode = MODE_DETAIL;
+				detail_from_map = 0;
 				zoom = 1.0f;
 				panx = pany = 0.0f;
 				slide_x = slide_goal = 0;
@@ -600,7 +623,8 @@ int main(void)
 							 * server/backup page */
 							do_open_cloud = 1;
 						} else if (touch_x > BAR_PX + BAR_W) {
-							/* map button (placeholder) */
+							/* map button: open the map */
+							do_open_map = 1;
 						} else if (g_search_active &&
 						    touch_x > BAR_CLEAR_CX - 16)
 							do_search_clear = 1;
@@ -616,6 +640,7 @@ int main(void)
 						if (i >= 0) {
 							sel = i;
 							mode = MODE_DETAIL;
+							detail_from_map = 0;
 							zoom = 1.0f;
 							panx = pany = 0.0f;
 							slide_x = slide_goal = 0;
@@ -641,6 +666,11 @@ int main(void)
 
 				if (do_open_cloud) {
 					mode = MODE_CLOUD;
+					continue;
+				}
+				if (do_open_map) {
+					mode = MODE_MAP;
+					touch_active = touch_on_bar = 0;
 					continue;
 				}
 
@@ -1039,9 +1069,10 @@ int main(void)
 				}
 			}
 			if (pressed & SCE_CTRL_CIRCLE) {
-				/* back to the grid; if a full-res load is in
-				 * flight its result gets discarded there */
-				mode = MODE_GRID;
+				/* back to wherever we came from (the map if the
+				 * photo was opened from a marker, else the grid) */
+				mode = detail_from_map ? MODE_MAP : MODE_GRID;
+				detail_from_map = 0;
 				detail_idx = -1;
 				detail_loading = 0;
 				slide_x = slide_goal = 0;
@@ -1732,6 +1763,185 @@ pf_skip:
 				       RGBA8(235, 90, 85, 255), 26);
 
 			draw_hud("Up/Down scroll    O back");
+			vita2d_end_drawing();
+			vita2d_swap_buffers();
+		} else if (mode == MODE_MAP) {
+			/* geotag map, opened from the map button on the search
+			 * bar. markers load on a worker thread the first time;
+			 * the page animates a throbber until they arrive. */
+			if (g_map_state == 0) {
+				if (!g_map_fetching) {
+					g_map_fetching = 1;
+					SceUID mt = sceKernelCreateThread("mapfetch",
+						mapfetch_thread, 0x10000100,
+						64 * 1024, 0, 0, NULL);
+					if (mt >= 0)
+						sceKernelStartThread(mt, 0, NULL);
+					else {
+						fetch_map_markers(); /* fallback */
+						g_map_fetching = 0;
+					}
+				}
+				vita2d_start_drawing();
+				vita2d_clear_screen();
+				draw_throbber(SCREEN_W / 2.0f,
+					      SCREEN_H / 2.0f - 16.0f, 22.0f, frame);
+				draw_centered(SCREEN_H / 2 + 36,
+					      RGBA8(200, 200, 200, 255),
+					      "Loading map...");
+				if (pressed & SCE_CTRL_CIRCLE)
+					mode = MODE_GRID;
+				vita2d_end_drawing();
+				vita2d_swap_buffers();
+				sceDisplayWaitVblankStart();
+				continue;
+			}
+			if (g_map_state == -1) {
+				vita2d_start_drawing();
+				vita2d_clear_screen();
+				draw_centered(SCREEN_H / 2 - 10,
+					      RGBA8(220, 120, 120, 255),
+					      "Map unavailable (see log.txt)");
+				draw_centered(SCREEN_H / 2 + 24,
+					      RGBA8(160, 160, 165, 255),
+					      "O back");
+				if (pressed & SCE_CTRL_CIRCLE)
+					mode = MODE_GRID;
+				vita2d_end_drawing();
+				vita2d_swap_buffers();
+				sceDisplayWaitVblankStart();
+				continue;
+			}
+			if (!g_map_view_init) {
+				map_fit_view();
+				g_map_view_init = 1;
+			}
+			if (pressed & SCE_CTRL_CIRCLE) {
+				mode = MODE_GRID;
+				continue;
+			}
+
+			/* d-pad pans (held = continuous), L/R zoom about centre.
+			 * pan step is in screen px, converted to merc by the scale
+			 * so it feels the same at every zoom level. */
+			double pstep = 14.0 / g_map_scale;
+			if (pad.buttons & SCE_CTRL_LEFT)  g_map_cx -= pstep;
+			if (pad.buttons & SCE_CTRL_RIGHT) g_map_cx += pstep;
+			if (pad.buttons & SCE_CTRL_UP)    g_map_cy -= pstep;
+			if (pad.buttons & SCE_CTRL_DOWN)  g_map_cy += pstep;
+			if (pad.buttons & SCE_CTRL_RTRIGGER) g_map_scale *= 1.03;
+			if (pad.buttons & SCE_CTRL_LTRIGGER) g_map_scale /= 1.03;
+			map_clamp_view();
+
+			/* touch: one finger drags the map, two fingers pinch-zoom,
+			 * a tap acts on the bubble under it (zoom in, or open a
+			 * lone photo) */
+			int tapped_cluster = -2; /* -2 none, -1 empty, >=0 bubble */
+			{
+				SceTouchData td;
+				sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
+				if (td.reportNum >= 2) {
+					float ax = td.report[0].x * 0.5f;
+					float ay = td.report[0].y * 0.5f;
+					float bx = td.report[1].x * 0.5f;
+					float by = td.report[1].y * 0.5f;
+					float dist = sqrtf((ax - bx) * (ax - bx) +
+							   (ay - by) * (ay - by));
+					if (map_pinch > 1.0f && dist > 1.0f) {
+						g_map_scale *= dist / map_pinch;
+						map_clamp_view();
+					}
+					map_pinch = dist;
+					touch_active = 1;
+					touch_dragged = 1;
+				} else if (td.reportNum == 1) {
+					float tx = td.report[0].x * 0.5f;
+					float ty = td.report[0].y * 0.5f;
+					map_pinch = 0;
+					if (!touch_active) {
+						touch_active = 1;
+						touch_dragged = 0;
+						touch_start_x = tx;
+						touch_start_y = ty;
+						touch_x = tx;
+						touch_y = ty;
+					} else {
+						if (fabsf(tx - touch_start_x) > 10 ||
+						    fabsf(ty - touch_start_y) > 10)
+							touch_dragged = 1;
+						if (touch_dragged) {
+							g_map_cx -= (tx - touch_x) /
+								    g_map_scale;
+							g_map_cy -= (ty - touch_y) /
+								    g_map_scale;
+							map_clamp_view();
+						}
+						touch_x = tx;
+						touch_y = ty;
+					}
+				} else {
+					if (touch_active && !touch_dragged) {
+						tapped_cluster =
+							map_cluster_at(touch_x, touch_y);
+						if (tapped_cluster < 0)
+							tapped_cluster = -1;
+					}
+					touch_active = 0;
+					map_pinch = 0;
+				}
+			}
+
+			map_cluster();
+			int nc = map_nearest_cluster();
+
+			/* X acts on the bubble nearest the centre; a tap acts on
+			 * the bubble under the finger. a lone photo opens in the
+			 * detail view (if it's been paged into the library),
+			 * a multi-photo bubble zooms in to split it apart. */
+			int act = -1;
+			if (pressed & SCE_CTRL_CROSS)
+				act = nc;
+			else if (tapped_cluster >= 0)
+				act = tapped_cluster;
+			if (act >= 0 && act < g_cl_count) {
+				if (map_should_open(act)) {
+					int s;
+					if (map_open_marker(g_cl_rep[act], &s)) {
+						sel = s;
+						mode = MODE_DETAIL;
+						detail_from_map = 1;
+						zoom = 1.0f;
+						panx = pany = 0.0f;
+						slide_x = slide_goal = 0;
+						slide_anim = 0;
+						detail_idx = -1;
+						grid_last_sel = -1;
+						continue;
+					}
+					map_zoom_into(act); /* couldn't open: just zoom */
+				} else {
+					map_zoom_into(act);
+				}
+			}
+
+			vita2d_start_drawing();
+			vita2d_clear_screen();
+			map_draw_tiles();
+			map_draw_clusters(nc);
+			/* centre crosshair: shows what X will act on */
+			vita2d_draw_rectangle(SCREEN_W / 2.0f - 8, SCREEN_H / 2.0f,
+					      16, 1, RGBA8(255, 255, 255, 90));
+			vita2d_draw_rectangle(SCREEN_W / 2.0f, SCREEN_H / 2.0f - 8,
+					      1, 16, RGBA8(255, 255, 255, 90));
+			{
+				char mh[96];
+				snprintf(mh, sizeof(mh), "Places  -  %d geotagged",
+					 g_map_count);
+				draw_text(12, 28, RGBA8(235, 235, 240, 255), 1.0f, mh);
+				draw_text(12, SCREEN_H - 16,
+					  RGBA8(150, 150, 158, 255), 0.85f,
+					  "d-pad pan   L/R zoom   X open/zoom   O back");
+			}
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
 		}

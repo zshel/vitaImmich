@@ -129,7 +129,7 @@ it live, which is exactly why we capture every frame to disk.
 
 ---
 
-## 4. Read the logs — verify from TEXT, not frames
+## 4. Read the logs or screenshots
 
 **Capturing a frame is free** (PNGs on disk are not in context). **Reading a PNG
 back into context is the expensive part.** So capture every command, but **do not
@@ -147,9 +147,7 @@ errors. Also available:
 - `/tmp/vita3k-runtime.log` (Vita3K runtime stdout/stderr from `deploy.sh`).
 - `/tmp/vita3k-install.log` (install output).
 
-**Only Read a frame** when a screenshot is genuinely the only way to resolve an
-ambiguity (rare). Reading every frame is what bloats context — that's what this
-rule avoids.
+read the screenshot if its usefull for the current task
 
 ### Typical verify loop
 

@@ -154,6 +154,7 @@ static char (*g_tex_err)[160];
 #include "thumbs.c"    /* background thumbnail loader + texture pool     */
 #include "display.c"   /* merged server+local timeline + grid layout     */
 #include "ui.c"        /* grid/detail/search/login/cloud screens         */
+#include "map.c"       /* geotag map: markers, clustering, projection    */
 #include "video.c"     /* video download + SceAvPlayer playback          */
 #include "sync.c"      /* local scan/hash/check/upload + sync overview   */
 #include "app.c"       /* main(): init, event loop, threads             */
