@@ -48,9 +48,21 @@ static int load_config(void)
 		return -1;
 	}
 
-	char line[512];
-	while (fgets(line, sizeof(line), f)) {
-		char *s = clean_line(line);
+	/* Manual line split instead of fgets(): the Vita3K *web* (wasm interpreter) build
+	 * mis-scans fgets's newline and returns the whole file as one line, so server=
+	 * captured every following line too. Read the file whole and split on '\n' by hand
+	 * (fread + a plain char loop avoid the broken libc path). Native Vita is unaffected. */
+	char fbuf[4096];
+	size_t flen = fread(fbuf, 1, sizeof(fbuf) - 1, f);
+	fbuf[flen] = '\0';
+	char *lp = fbuf;
+	while (*lp) {
+		char *eol = lp;
+		while (*eol && *eol != '\n')
+			eol++;
+		char eolsave = *eol;
+		*eol = '\0';
+		char *s = clean_line(lp);
 		if (!strncmp(s, "server=", 7))
 			snprintf(g_server, sizeof(g_server), "%s", clean_line(s + 7));
 		else if (!strncmp(s, "apikey=", 7))
@@ -74,6 +86,9 @@ static int load_config(void)
 			}
 		} else if (!strncmp(s, "syncmaxmb=", 10))
 			g_syncmax_mb = atol(clean_line(s + 10));
+		if (!eolsave)
+			break;
+		lp = eol + 1;
 	}
 	fclose(f);
 
