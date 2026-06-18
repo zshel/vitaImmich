@@ -1,151 +1,157 @@
-# vitaImmich
+<div align="center">
 
-Minimal proof-of-concept [Immich](https://immich.app/) client for the PS Vita.
-It connects to your Immich server and shows your library (photos and videos)
-as a scrollable chronological grid (newest first), with a full-screen viewer
-and hardware-accelerated video playback.
+# 📷 vitaImmich
 
-## Requirements
+### Your self-hosted photo library, in your hands.
 
-- A PS Vita with HENkaku/h-encore and VitaShell
-- An Immich server reachable from the Vita's Wi-Fi (recent Immich version —
-  it uses `POST /api/search/random` and `GET /api/assets/{id}/thumbnail`)
-- An Immich API key (web UI → Account Settings → API Keys)
+A native **[Immich](https://immich.app/)** client for the **PlayStation Vita** —
+browse, search and map your whole photo & video library over Wi‑Fi, play videos
+on the Vita's hardware decoder, and back up the camera roll, all on a 12‑year‑old
+handheld.
 
-## Building
+</div>
 
-Needs [VitaSDK](https://vitasdk.org/) with the `libvita2d`, `curl`, `openssl`,
-`zstd`, `zlib`, `libpng`, `libjpeg-turbo` and `freetype` packages installed
-(via `vdpm`).
+<table>
+<tr>
+<td width="33%"><img src="docs/timeline.png" alt="Timeline and smart search"></td>
+<td width="33%"><img src="docs/places.png" alt="Geotag Places map"></td>
+<td width="33%"><img src="docs/backup.png" alt="Server and backup overview"></td>
+</tr>
+<tr>
+<td align="center"><b>Timeline &amp; search</b></td>
+<td align="center"><b>Places map</b></td>
+<td align="center"><b>Server &amp; backup</b></td>
+</tr>
+</table>
 
-```sh
-export VITASDK=$HOME/vitasdk
-export PATH=$VITASDK/bin:$PATH
-cmake -B build -S .
-cmake --build build
-```
+---
 
-This produces `build/vitaImmich.vpk`.
+## ✨ Features
 
-## Installing & configuring
+- 🗓️ **Timeline** — your entire library as a justified, date‑grouped grid (newest first), styled after the Immich web app.
+- 🔍 **Smart search** — free‑text CLIP search straight from the Vita's keyboard.
+- 🗺️ **Places map** — geotagged photos clustered on a world map; pan/zoom with the sticks and open any cluster as its own gallery.
+- 🖼️ **Full‑screen viewer** — pinch/stick zoom & pan, swipe between photos, hardware‑accelerated **H.264 video** playback.
+- ☁️ **Camera‑roll backup** — scans the Vita's photos & videos, dedupes against the server, and uploads on request.
+- 📊 **Server overview** — storage usage, server/app versions, and per‑device backup status.
+- 👆 **Touch + buttons** — the whole UI is drivable with the front touchscreen or the d‑pad/sticks.
 
-1. Copy `vitaImmich.vpk` to the Vita and install it with VitaShell.
-2. Launch it once — it creates `ux0:data/vitaimmich/config.txt`.
-3. Edit that file (VitaShell → SELECT for FTP makes this easy):
+> **Status:** proof‑of‑concept. App title id **`VIMM00001`**. See [limitations](#-limitations).
 
-   ```
+## 📦 Requirements
+
+- A PS Vita running **HENkaku/h‑encore** with **VitaShell**.
+- A reasonably recent **Immich server** reachable over the Vita's Wi‑Fi.
+- An **Immich API key** (web UI → *Account Settings → API Keys*), or an email/password.
+
+## 🚀 Install & configure
+
+1. Grab `vitaImmich.vpk` from the [latest release](https://codeberg.org/SadsArches/vitaImmich/releases) (or build it — see below) and install it with **VitaShell**.
+2. Launch it once; it creates `ux0:data/vitaimmich/config.txt`.
+3. Edit that file (VitaShell's FTP, **SELECT**, makes this easy):
+
+   ```ini
    server=http://192.168.1.100:2283
    apikey=your-immich-api-key
    ```
 
-   If your server sits behind a public domain (reverse proxy) and your
-   router does not support NAT loopback, add the server's LAN IP so the
-   domain is pinned to it while on your home network:
+   Behind a reverse proxy without NAT loopback? Pin the domain to your LAN IP
+   so the Host header / TLS SNI stay on the domain but the connection goes
+   straight to the server:
 
-   ```
+   ```ini
    server=https://immich.example.com
    apikey=your-immich-api-key
    serverip=192.168.1.100
    ```
 
-   This keeps the Host header and TLS SNI on the domain (so the reverse
-   proxy still routes correctly) but connects to the LAN IP directly.
+4. Relaunch.
 
-4. Relaunch the app.
+## 🎮 Controls
 
-## Controls
+**Timeline**
 
-Grid view:
+| Button | Action |
+| --- | --- |
+| D‑pad / sticks | Move selection (hold to repeat) |
+| L / R | Jump a month up / down |
+| △ | Smart search |
+| X | Open full screen |
+| 🗺️ / ☁️ (touch) | Open the Places map / server page |
+| SELECT | Sync overview |
+| START | Exit |
 
-| Button        | Action                          |
-| ------------- | ------------------------------- |
-| D-pad         | Move selection (hold to repeat) |
-| L / R         | Jump two rows up / down         |
-| X             | Open item full screen           |
-| SELECT        | Open the sync overview          |
-| START         | Exit                            |
+**Places map**
 
-Full-screen view:
+| Button | Action |
+| --- | --- |
+| Left stick / d‑pad / drag | Pan |
+| Right stick / L · R | Zoom out / in |
+| X | Open the centred cluster as a gallery |
+| △ | Toggle the lat/lon graticule |
+| O | Back |
 
-| Button        | Action                            |
-| ------------- | --------------------------------- |
-| Left / Right  | Previous / next item              |
-| X             | Play video / retry a failed photo |
-| O             | Back to grid                      |
-| SELECT        | Open the sync overview            |
-| START         | Exit                              |
+**Full‑screen viewer**
 
-Sync overview (SELECT):
+| Button | Action |
+| --- | --- |
+| ← / → | Previous / next |
+| Right stick / L · R | Zoom · left stick pans |
+| X | Play video / retry a failed load |
+| O | Back |
 
-| Button        | Action                              |
-| ------------- | ----------------------------------- |
-| X             | Queue all local-only files to upload|
-| O / SELECT    | Back                                |
-| START         | Exit                                |
+**Video playback** — X pause/resume · ←/→ seek ±10 s · O stop.
 
-Video playback:
+## 🔧 Building
 
-| Button        | Action            |
-| ------------- | ----------------- |
-| X             | Pause / resume    |
-| Left / Right  | Seek ±10 seconds  |
-| O             | Stop and go back  |
+Needs [VitaSDK](https://vitasdk.org/) with `libvita2d`, `curl`, `openssl`,
+`zstd`, `zlib`, `libpng`, `libjpeg-turbo` and `freetype` (install via `vdpm`).
 
-More of the library is fetched automatically (100 photos at a time, newest
-first) as you scroll toward the end. Errors are shown on screen and logged
-to `ux0:data/vitaimmich/log.txt`.
+```sh
+export VITASDK=$HOME/vitasdk
+export PATH=$VITASDK/bin:$PATH
+cmake -B build -S .
+cmake --build build           # -> build/vitaImmich.vpk
+```
 
-## Syncing the Vita's camera media
+The sources in `src/` are a **unity build**: `main.c` `#include`s the section
+files (`state.c`, `draw.c`, … `app.c`) into one translation unit, so only
+`main.c` is compiled. The geotag map's base tiles live in `assets/maptiles.pak`,
+generated from a world‑map image by `tools/png_to_tiles.py`.
 
-On startup the app mounts the Photos app's storage (`photo0:`, i.e. the
-ACL-protected `ux0:picture` where camera shots and recordings live) via
-`sceAppMgrAppDataMount`, scans it (plus `ux0:video/CAMERA`, a few levels
-deep; `.jpg/.jpeg/.png/.mp4`) and merges those files into the same
-date-sorted grid as your server library.
-Files larger than 512 MB are skipped so a movie collection in `ux0:video`
-is never hashed or offered for upload. Both knobs live in `config.txt`:
-`syncdir=<folder>` (repeatable, replaces the default scan locations) and
-`syncmaxmb=<MB>` (the size cap; 0 disables it).
-A small badge in the top-left corner of each cell shows its status:
+## ☁️ Camera‑roll backup
 
-- blue-grey dot — **cloud only** (a server asset not present on the Vita)
-- orange up-arrow — **local only** (on the Vita, not yet on the server)
-- blinking orange — **queued / uploading**
-- green check — **backed up** (exists on both; shown once, as the server asset)
-- red dot — **failed** (see the sync overview for the reason)
+On startup the app mounts the Photos app's storage (`photo0:` /
+`ux0:picture`) plus `ux0:video/CAMERA`, scans for `.jpg/.jpeg/.png/.mp4`, and
+merges those files into the same date‑sorted timeline as your server library. A
+badge in each cell's corner shows status:
 
-A background thread hashes each local file (SHA1) and asks the server which
-ones already exist (`POST /api/assets/bulk-upload-check`). Hashing and the
-duplicate check start automatically. Uploads do **not** start on their own:
-open the sync overview with **SELECT** and press **X** to queue every
-local-only file. Each upload is a `POST /api/assets` multipart request with
-an `x-immich-checksum` header for fast server-side dedup; progress is shown
-in the overview.
+- 🔵 blue‑grey dot — **cloud only**
+- 🔶 orange up‑arrow — **local only**
+- 🟠 blinking — **queued / uploading**
+- 🟢 green check — **backed up** (on both; shown once, as the server asset)
+- 🔴 red dot — **failed**
 
-## PoC limitations
+A background thread SHA‑1‑hashes each local file and asks the server which
+already exist (`bulk-upload-check`). Uploads never start on their own — open the
+sync overview (**SELECT**) and press **X** to queue every local‑only file.
+Tunables in `config.txt`: `syncdir=<folder>` (repeatable) and `syncmaxmb=<MB>`
+(size cap; files over 512 MB are skipped by default, 0 disables).
 
-- TLS certificate verification is disabled (no CA bundle is shipped), so
-  prefer plain HTTP on a trusted LAN or treat HTTPS as unverified.
-- Thumbnails stream in on a background thread (one at a time over a
-  keep-alive connection); cells show a grey placeholder until loaded.
-- Videos are downloaded in full to `ux0:data/vitaimmich/video.mp4` before
-  playback (deleted afterwards), so they need free space on the memory card
-  and a moment to start. Playback uses the Vita's hardware decoder via
-  SceAvPlayer, so only MP4 (H.264/AAC) plays — Immich's transcoded
-  `video/playback` stream is used, which is H.264 with default server
-  settings. The decoder rotates four output frame buffers (~13 MB CDRAM at
-  1080p) so async GPU rendering can't be torn by a recycled frame.
-- Caps at 1000 server assets and 500 local camera files per launch; no
-  albums or search.
-- Local media sync is one-way (Vita → server). It scans `ux0:picture` and
-  `ux0:video/CAMERA` by default (the standard camera locations), recursing
-  ~2 levels; use `syncdir=` in the config to scan other folders.
-- Local video grid cells show a poster thumbnail (with the VIDEO badge):
-  the first frame is decoded with SceAvPlayer on the background loader
-  thread (NV12 -> RGB, downscaled), the same handoff as photos. Poster
-  extraction and playback share the single hardware decoder, so a poster is
-  never decoded while a video is playing (and vice versa).
-- Hashing 500 files at startup takes a while; it runs in the background so
-  browsing is never blocked, but statuses fill in gradually.
-- `deviceId` is hard-coded to "PS Vita" and uploads are not associated with
-  an album.
+## ⚠️ Limitations
+
+- **TLS verification is disabled** (no CA bundle ships) — prefer plain HTTP on a
+  trusted LAN, or treat HTTPS as unverified.
+- Videos download in full to the memory card before playing (deleted after).
+  Playback is the Vita's hardware decoder via SceAvPlayer, so only **MP4
+  (H.264/AAC)** plays — Immich's transcoded `video/playback` stream is used.
+- Backup is **one‑way** (Vita → server); `deviceId` is hard‑coded to "PS Vita"
+  and uploads aren't added to an album.
+- Thumbnails stream in one at a time on a background thread (grey placeholder
+  until loaded); hashing the camera roll fills statuses in gradually.
+
+---
+
+<div align="center">
+Made by <b>SadsArches</b> with love. ❤️
+</div>
