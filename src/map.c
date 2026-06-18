@@ -32,17 +32,33 @@ static volatile int g_map_fetching;  /* a worker thread is fetching now */
  * on-screen pixel size (256 << zoom). g_map_view_init is cleared so the
  * first time the page opens (and after an account switch) it fits to the
  * markers' bounding box instead of showing a stale view. */
+/* zoom limits — g_map_scale is the whole world's on-screen width in px.
+ * MIN stops zoom-out once the map covers the screen with no black bars; the map
+ * is taller-aspect than the screen, so the poles and a little longitude crop off
+ * (pan to reach them) rather than leaving margins. MAX is about country/region
+ * level — ~4x the deepest tile LOD (10496px), so the raster base map stays
+ * legible rather than blurring into mush as the old deep caps did. */
+#define MAP_SCALE_MIN 1200.0
+#define MAP_SCALE_MAX 4.0e4
+/* the base map's ocean colour — fills the view behind/around the tiles so the
+ * margins (and any gap while tiles stream in) read as sea, not black */
+#define MAP_OCEAN_BG RGBA8(217, 187, 149, 255)
 static double g_map_cx = 0.5, g_map_cy = 0.5;
-static double g_map_scale = 512.0;
+static double g_map_scale = MAP_SCALE_MIN;
 static int g_map_view_init;
+static int g_map_grid = 0;   /* overlay the computed graticule (toggle: TRIANGLE) */
 
 #define MAP_PI 3.14159265358979323846
 
-/* The source map (MapChart_Map (4)) is a clean conformal full-longitude Web
- * Mercator: lon -180..180 across its width, latitude band MAP_IMG_MY0..MY1.
- * Verified by isolated-island centroids (span 360.0°, x/y scales match). */
-#define MAP_LON0 (-180.0)    /* longitude at the image's left edge  */
-#define MAP_LON1 (180.0)     /* longitude at the image's right edge */
+/* The source map (a mapchart.net world map, city-label variant) is a
+ * near-conformal full-longitude Web Mercator: lon spans the image width,
+ * latitude band MAP_IMG_MY0..MY1. These bounds were fit by least-squares against
+ * the pixel-identical graticule export of the same map (meridian residual
+ * <0.5px, parallel <2.3px over 7000px) — that sibling shares this one's exact
+ * crop (verified: 0px phase-correlation shift), so the fit transfers directly.
+ * The image runs ~0.45° past ±180 each side. */
+#define MAP_LON0 (-180.40)   /* longitude at the image's left edge  */
+#define MAP_LON1 (180.50)    /* longitude at the image's right edge */
 
 /* lon/lat -> normalised image coords [0,1]. y is standard Web-Mercator (lat
  * clamped to the valid band); the image's merc-y bounds are MAP_IMG_MY0/MY1. */
@@ -168,8 +184,8 @@ static void fetch_map_markers(void)
 /* keep the centre on the map and the zoom within sane bounds */
 static void map_clamp_view(void)
 {
-	if (g_map_scale < 360.0)        g_map_scale = 360.0;       /* ~whole world */
-	if (g_map_scale > 2.0e8)        g_map_scale = 2.0e8;       /* street level */
+	if (g_map_scale < MAP_SCALE_MIN) g_map_scale = MAP_SCALE_MIN;  /* whole world */
+	if (g_map_scale > MAP_SCALE_MAX) g_map_scale = MAP_SCALE_MAX;  /* neighbourhood */
 	if (g_map_cx < 0.0) g_map_cx = 0.0;
 	if (g_map_cx > 1.0) g_map_cx = 1.0;
 	if (g_map_cy < 0.0) g_map_cy = 0.0;
@@ -183,7 +199,7 @@ static void map_fit_view(void)
 	if (g_map_count <= 0) {
 		g_map_cx = 0.5;
 		g_map_cy = 0.5;
-		g_map_scale = 512.0;
+		g_map_scale = MAP_SCALE_MIN;
 		map_clamp_view();
 		return;
 	}
@@ -202,9 +218,9 @@ static void map_fit_view(void)
 	if (h < 1e-9) h = 1e-9;
 	double sx = SCREEN_W * 0.82 / w, sy = SCREEN_H * 0.82 / h;
 	g_map_scale = sx < sy ? sx : sy;
-	/* a single point fits at "infinite" zoom — pull back to a city view */
-	if (g_map_scale > 4.0e6)
-		g_map_scale = 4.0e6;
+	/* a single point fits at "infinite" zoom — pull back to the max zoom */
+	if (g_map_scale > MAP_SCALE_MAX)
+		g_map_scale = MAP_SCALE_MAX;
 	map_clamp_view();
 }
 
@@ -226,13 +242,19 @@ static int g_cl_count;
 /* Group markers into bubbles. The grid cells are anchored in MAP (Web-Mercator)
  * space, not screen space, so panning leaves each marker in the same cell and
  * the bubbles simply translate with the map instead of reshuffling/jumping.
- * Cell size tracks zoom (~MAP_CELL px wide at the current scale). */
+ *
+ * The cell size is keyed off a scale SNAPPED to the nearest power-of-two octave,
+ * not the live scale: the live scale changes every frame while zooming, which
+ * drifts the cell boundaries so markers hop cells and the bubbles jitter. With
+ * the snap, the grid is fixed across a ~1.4x zoom band and only re-forms once
+ * per octave, so during a zoom the bubbles just glide/scale with the map. */
 static void map_cluster(void)
 {
 	g_cl_count = 0;
 	if (g_map_scale <= 0.0)
 		return;
-	double cellsz = (double)MAP_CELL / g_map_scale;  /* merc units per cell */
+	double qscale = pow(2.0, round(log2(g_map_scale)));  /* octave-snapped */
+	double cellsz = (double)MAP_CELL / qscale;       /* merc units per cell */
 	for (int i = 0; i < g_map_count; i++) {
 		double mx = merc_x(g_map_lon[i]), my = merc_y(g_map_lat[i]);
 		float sx, sy;
@@ -314,30 +336,6 @@ static int map_cluster_at(float x, float y)
 	return -1;
 }
 
-/* a tap/X on cluster c should OPEN its photo (rather than zoom in) when it's a
- * lone marker, or when its members are effectively on the same spot so zooming
- * would never split them (common with photos shot at one place). */
-static int map_should_open(int c)
-{
-	if (c < 0 || c >= g_cl_count)
-		return 0;
-	if (g_cl_n[c] <= 1)
-		return 1;
-	return (g_cl_x1[c] - g_cl_x0[c] < 6.0f &&
-		g_cl_y1[c] - g_cl_y0[c] < 6.0f);
-}
-
-/* recentre on a cluster and zoom in a notch (splits dense bubbles apart) */
-static void map_zoom_into(int c)
-{
-	if (c < 0 || c >= g_cl_count)
-		return;
-	g_map_cx += (g_cl_x[c] - SCREEN_W / 2.0f) / g_map_scale;
-	g_map_cy += (g_cl_y[c] - SCREEN_H / 2.0f) / g_map_scale;
-	g_map_scale *= 2.6;
-	map_clamp_view();
-}
-
 /* resolve a marker's asset to a display slot, opening it in the detail view.
  * the map lists the whole server, so the asset is often not among the pages
  * fetched for the grid — in that case fetch its metadata, append it to the
@@ -379,6 +377,7 @@ static int map_open_marker(int marker_idx, int *out_sel)
 		g_asset_rot[idx] = 0;
 		g_asset_is_video[idx] = !strncmp(tval, "VIDEO", 5);
 		g_asset_local_backed[idx] = 0;
+		g_asset_hidden[idx] = 0;
 		g_thumb[idx] = NULL;
 		g_thumb_failed[idx] = 0;
 		g_tex_err[idx][0] = '\0';
@@ -397,11 +396,11 @@ static int map_open_marker(int marker_idx, int *out_sel)
 }
 
 /* latitude band of the source image, in normalised Web-Mercator. NOT simply
- * image-height/width: MapChart's vertical scale differs slightly from its
- * horizontal, so these were fit against the real marker coordinates (so the
- * photos land on land, not offset north into the water). ~76.6°N .. -59.9°S. */
-#define MAP_IMG_MY0 0.03993   /* top edge  (~83.5°N) */
-#define MAP_IMG_MY1 0.95395   /* bottom edge (~-83.5°S) */
+ * image-height/width: the source's vertical scale differs ~0.4% from its
+ * horizontal, so these were fit against the image's baked-in graticule (the
+ * equator sits at y=3213 of 6352, ~37px below image centre). ~83.7°N .. -83.3°S. */
+#define MAP_IMG_MY0 0.03814   /* top edge  (~83.7°N) */
+#define MAP_IMG_MY1 0.95125   /* bottom edge (~-83.3°S) */
 
 /* ------------------------------------------------------------------ */
 /* raster tile pyramid (app0:maptiles.pak) — the LOD base map.         */
@@ -641,6 +640,41 @@ static void map_draw_grid(void)
 	}
 }
 
+/* Lat/lon graticule, projected with merc_x/merc_y + MAP_LON0/1 + MAP_IMG_MY0/1
+ * (the same maths the markers use), drawn bright over the tiled base map at 10°
+ * spacing. The current city-label base map has no printed grid, so this is the
+ * only graticule; against the graticule export it coincided to ~1px, which is
+ * how the georeferencing was validated. Prime meridian and equator are brighter
+ * to anchor orientation. Toggle with TRIANGLE. */
+static void map_draw_graticule(void)
+{
+	uint32_t reg = RGBA8(225, 45, 45, 140);    /* translucent red */
+	uint32_t axis = RGBA8(255, 90, 90, 230);   /* lon 0 / equator */
+	/* clip the overlay to the base-map rectangle (clamped to the screen) so
+	 * each line spans only where the map is, not the black margins around it */
+	float lx, ty, rx, by;
+	map_project(0.0, MAP_IMG_MY0, &lx, &ty);   /* image top-left  */
+	map_project(1.0, MAP_IMG_MY1, &rx, &by);   /* image bot-right */
+	if (lx < 0) lx = 0;
+	if (ty < 0) ty = 0;
+	if (rx > SCREEN_W) rx = SCREEN_W;
+	if (by > SCREEN_H) by = SCREEN_H;
+	for (int lon = -180; lon <= 180 && by > ty; lon += 10) {
+		float sx, sy;
+		map_project(merc_x(lon), 0.0, &sx, &sy);
+		if (sx >= 0 && sx <= SCREEN_W)
+			vita2d_draw_rectangle(sx, ty, 1, by - ty,
+					      lon == 0 ? axis : reg);
+	}
+	for (int lat = -80; lat <= 80 && rx > lx; lat += 10) {
+		float sx, sy;
+		map_project(0.0, merc_y(lat), &sx, &sy);
+		if (sy >= 0 && sy <= SCREEN_H)
+			vita2d_draw_rectangle(lx, sy, rx - lx, 1,
+					      lat == 0 ? axis : reg);
+	}
+}
+
 /* draw every cluster bubble; `sel` gets a white selection ring */
 static void map_draw_clusters(int sel)
 {
@@ -663,4 +697,115 @@ static void map_draw_clusters(int sel)
 		int w = text_width(0.8f, b);
 		draw_text(x - w / 2.0f, y + 6.0f, white, 0.8f, b);
 	}
+}
+
+/* ------------------------------------------------------------------ */
+/* cluster gallery                                                     */
+/*                                                                     */
+/* Selecting a bubble shows every photo it groups on the SAME grid as  */
+/* the timeline/search — a filtered view (g_gallery_*). Members already */
+/* paged into the library are reused; the rest are appended as hidden   */
+/* g_asset entries (id + thumb only) whose date/aspect the metadata     */
+/* worker fills in lazily, so the justified grid sorts into month       */
+/* sections and true aspect ratios as the data arrives.                 */
+/* ------------------------------------------------------------------ */
+
+/* g_asset index for an id: an existing entry, or a freshly appended hidden one
+ * (lets the gallery show a marker not yet paged into the library). -1 on OOM. */
+static int asset_for_id(const char *id)
+{
+	for (int i = 0; i < g_asset_count; i++)
+		if (!strcmp(g_asset_ids[i], id))
+			return i;
+	if (!grow_assets(g_asset_count + 1))
+		return -1;
+	int idx = g_asset_count++;
+	snprintf(g_asset_ids[idx], sizeof(g_asset_ids[0]), "%s", id);
+	g_asset_dates[idx][0] = '\0';   /* "" = unresolved; meta_worker fills it */
+	g_asset_ratio[idx] = 0.0f;
+	g_asset_rot[idx] = 0;
+	g_asset_is_video[idx] = 0;
+	g_asset_local_backed[idx] = 0;
+	g_asset_hidden[idx] = 1;        /* gallery-only: kept out of the timeline */
+	g_thumb[idx] = NULL;
+	g_thumb_failed[idx] = 0;
+	g_tex_err[idx][0] = '\0';
+	return idx;
+}
+
+/* open the gallery for cluster c: collect its members (same merc cell as the
+ * bubble) into g_gallery_idx, then rebuild the grid to show them */
+static void gallery_open(int c)
+{
+	g_gallery_count = 0;
+	if (c < 0 || c >= g_cl_count || g_map_scale <= 0.0)
+		return;
+	double qscale = pow(2.0, round(log2(g_map_scale)));
+	double cellsz = (double)MAP_CELL / qscale;
+	int tgx = g_cl_gx[c], tgy = g_cl_gy[c];
+	for (int i = 0; i < g_map_count; i++) {
+		double mx = merc_x(g_map_lon[i]), my = merc_y(g_map_lat[i]);
+		float sx, sy;
+		map_project(mx, my, &sx, &sy);
+		if (sx < -90 || sx > SCREEN_W + 90 ||
+		    sy < -90 || sy > SCREEN_H + 90)
+			continue;
+		if ((int)(mx / cellsz) != tgx || (int)(my / cellsz) != tgy)
+			continue;
+		int idx = asset_for_id(g_map_id[i]);
+		if (idx < 0 || !grow_gallery(g_gallery_count + 1))
+			break;
+		g_gallery_idx[g_gallery_count++] = idx;
+	}
+	g_gallery_active = 1;
+	rebuild_display();
+}
+
+static void gallery_close(void)
+{
+	g_gallery_active = 0;
+	rebuild_display();
+}
+
+/* lazy fill: apply a finished metadata result (re-laying out the grid so the
+ * item drops into its month/aspect), then request the next missing one —
+ * visible slots first. g_meta_target is a g_asset index, so it stays valid
+ * across the rebuilds that reorder g_disp. */
+static void gallery_meta_pump(int first_vis, int last_vis,
+			      int *sel, float *scroll, float *target)
+{
+	if (g_meta_state == META_DONE) {
+		int t = g_meta_target;
+		if (t >= 0 && t < g_asset_count && g_meta_date[0]) {
+			snprintf(g_asset_dates[t], sizeof(g_asset_dates[0]), "%s",
+				 g_meta_date);
+			g_asset_ratio[t] = g_meta_ratio;
+			g_asset_rot[t] = g_meta_rot;
+			g_asset_is_video[t] = (unsigned char)g_meta_is_video;
+		} else if (t >= 0 && t < g_asset_count) {
+			/* fetch failed: stamp a placeholder date so we don't
+			 * spin on it forever (it just won't group by month) */
+			snprintf(g_asset_dates[t], sizeof(g_asset_dates[0]),
+				 "0000-00-00");
+		}
+		g_meta_state = META_IDLE;
+		rebuild_keep_view(sel, scroll, target);
+	}
+	if (g_meta_state != META_IDLE)
+		return;
+	int pick = -1;
+	for (int d = first_vis; pick < 0 && d >= 0 && d <= last_vis &&
+	     d < g_disp_count; d++)
+		if (g_disp[d].src == SRC_SERVER &&
+		    g_asset_dates[g_disp[d].idx][0] == '\0')
+			pick = g_disp[d].idx;
+	for (int k = 0; pick < 0 && k < g_gallery_count; k++)
+		if (g_asset_dates[g_gallery_idx[k]][0] == '\0')
+			pick = g_gallery_idx[k];
+	if (pick < 0)
+		return;
+	g_meta_target = pick;
+	snprintf(g_meta_id, sizeof(g_meta_id), "%s", g_asset_ids[pick]);
+	__sync_synchronize();
+	g_meta_state = META_PENDING;
 }

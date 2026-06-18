@@ -176,6 +176,24 @@ static void layout_grid(void)
  * server asset is shown once, as the server asset (green badge). */
 static void rebuild_display(void)
 {
+	/* map cluster gallery: show exactly the selected bubble's members (server
+	 * assets), date-grouped like the timeline. Members whose metadata hasn't
+	 * resolved yet have an empty date and sort to the end until it arrives. */
+	if (g_gallery_active) {
+		if (!grow_disp(g_gallery_count > 0 ? g_gallery_count : 1))
+			return;
+		int n = 0;
+		for (int k = 0; k < g_gallery_count; k++) {
+			g_disp[n].src = SRC_SERVER;
+			g_disp[n].idx = g_gallery_idx[k];
+			n++;
+		}
+		g_disp_count = n;
+		qsort(g_disp, n, sizeof(g_disp[0]), disp_cmp);
+		layout_grid();
+		return;
+	}
+
 	/* search mode: the merged timeline is replaced by the result set
 	 * (server assets only, date-grouped); local media isn't folded in */
 	if (g_search_active) {
@@ -201,6 +219,8 @@ static void rebuild_display(void)
 
 	int n = 0;
 	for (int i = 0; i < g_asset_count; i++) {
+		if (g_asset_hidden[i])
+			continue;   /* gallery-only asset: not in the timeline */
 		g_disp[n].src = SRC_SERVER;
 		g_disp[n].idx = i;
 		n++;

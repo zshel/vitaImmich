@@ -63,6 +63,29 @@ static int g_sect_count;
 static int g_sect_cap;
 static float g_content_h; /* total scrollable height incl. headers */
 
+/* map cluster gallery: the photos of one map bubble, shown on the SAME grid as
+ * the timeline/search — a filtered view like g_search_*. g_gallery_idx holds
+ * indices into the g_asset_* arrays for the bubble's members; members not
+ * already paged into the library are appended as g_asset entries flagged
+ * g_asset_hidden (so they appear only here, never in the main timeline). Their
+ * date/aspect are resolved lazily by the metadata worker below, so the grid
+ * reflows into real month sections + true aspect ratios as they arrive. */
+static int g_gallery_active;
+static int *g_gallery_idx;
+static int g_gallery_count;
+static int g_gallery_cap;
+
+/* background metadata resolver: a one-slot handoff (mirroring the thumb worker)
+ * that fetches one asset's date/aspect so the justified grid can place it. */
+enum { META_IDLE, META_PENDING, META_DONE };
+static volatile int g_meta_state = META_IDLE;
+static char g_meta_id[40];           /* asset id to resolve  (main -> worker) */
+static int g_meta_target;            /* g_asset index to fill (main-thread owned) */
+static char g_meta_date[DATELEN];    /* results (worker -> main) */
+static float g_meta_ratio;
+static unsigned char g_meta_rot;
+static int g_meta_is_video;
+
 /* free-text smart (CLIP) search. when active the grid shows only the matching
  * server assets — still date-grouped under month headers like the timeline —
  * instead of the full merged library; TRIANGLE opens the keyboard, CIRCLE (or
@@ -159,6 +182,7 @@ static int grow_assets(int need)
 	    !GROW(g_asset_rot, c, need) ||
 	    !GROW(g_asset_is_video, c, need) ||
 	    !GROW(g_asset_local_backed, c, need) ||
+	    !GROW(g_asset_hidden, c, need) ||
 	    !GROW(g_thumb, c, need) ||
 	    !GROW(g_thumb_failed, c, need) ||
 	    !(g_asset_cap = GROW(g_tex_err, c, need)))
@@ -211,6 +235,17 @@ static int grow_sect(int need)
 	if (!cap)
 		return 0;
 	g_sect_cap = cap;
+	return 1;
+}
+
+static int grow_gallery(int need)
+{
+	if (need <= g_gallery_cap)
+		return 1;
+	int cap = GROW(g_gallery_idx, g_gallery_cap, need);
+	if (!cap)
+		return 0;
+	g_gallery_cap = cap;
 	return 1;
 }
 

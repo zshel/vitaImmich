@@ -89,6 +89,7 @@ static int parse_assets(const char *js, size_t jslen, char *err, size_t errlen)
 			g_asset_ratio[cur] = 0.0f;
 			g_asset_rot[cur] = 0;
 			g_asset_is_video[cur] = 0;
+			g_asset_hidden[cur] = 0;
 			continue;
 		}
 		if (cur < 0 || tok[i].type != JSMN_STRING || tok[i].size != 1 ||
@@ -277,6 +278,104 @@ static int check_new_assets(void)
 	if (fresh > 0)
 		log_line("poll: %d new asset(s) on the server", fresh);
 	return fresh;
+}
+
+/* parse a single /api/assets/{id} object for the fields the grid needs to lay
+ * an item out: capture date, display aspect (from exif), orientation, video
+ * flag. returns 1 if the date was found. (parse_assets handles arrays; this is
+ * the one-object form used by the gallery's lazy metadata resolver.) */
+static int parse_one_asset(const char *js, size_t len, char *date, size_t datelen,
+			   float *ratio, unsigned char *rot, int *is_video)
+{
+	jsmn_parser p;
+	jsmn_init(&p);
+	int n = jsmn_parse(&p, js, len, NULL, 0);
+	if (n <= 0)
+		return 0;
+	jsmntok_t *t = malloc(sizeof(*t) * n);
+	if (!t)
+		return 0;
+	jsmn_init(&p);
+	n = jsmn_parse(&p, js, len, t, n);
+	if (n <= 0 || t[0].type != JSMN_OBJECT) {
+		free(t);
+		return 0;
+	}
+	date[0] = '\0';
+	*ratio = 0.0f;
+	*rot = 0;
+	*is_video = 0;
+	int exif_obj = -1, exw = 0, exh = 0, exori = 0, got = 0;
+	for (int i = 1; i + 1 < n; i++) {
+		if (t[i].type != JSMN_STRING || t[i].size != 1)
+			continue;
+		int kl = t[i].end - t[i].start;
+		const char *k = js + t[i].start;
+		jsmntok_t *v = &t[i + 1];
+		int vl = v->end - v->start;
+		if (t[i].parent == 0 && kl == 8 && !strncmp(k, "exifInfo", 8) &&
+		    v->type == JSMN_OBJECT) {
+			exif_obj = i + 1;
+			continue;
+		}
+		if (t[i].parent == exif_obj) {
+			if (kl == 14 && !strncmp(k, "exifImageWidth", 14))
+				exw = atoi(js + v->start);
+			else if (kl == 15 && !strncmp(k, "exifImageHeight", 15))
+				exh = atoi(js + v->start);
+			else if (kl == 11 && !strncmp(k, "orientation", 11))
+				exori = atoi(js + v->start);
+			continue;
+		}
+		if (t[i].parent != 0)
+			continue;
+		if (kl == 13 && !strncmp(k, "fileCreatedAt", 13) && vl >= 10) {
+			int cl = vl < (int)datelen - 1 ? vl : (int)datelen - 1;
+			memcpy(date, js + v->start, cl);
+			date[cl] = '\0';
+			got = 1;
+		} else if (kl == 4 && !strncmp(k, "type", 4)) {
+			*is_video = (vl >= 5 && !strncmp(js + v->start, "VIDEO", 5));
+		}
+	}
+	if (exw > 0 && exh > 0)
+		*ratio = (exori >= 5 && exori <= 8) ?
+			(float)exh / exw : (float)exw / exh;
+	*rot = (unsigned char)exori;
+	free(t);
+	return got;
+}
+
+/* background metadata resolver thread: fetches one asset's date/aspect at a
+ * time (the gallery's lazy fill). One-slot handoff like the thumb worker —
+ * main writes g_meta_id + flips to PENDING, we fetch+parse and flip to DONE. */
+static int meta_worker(SceSize args, void *argp)
+{
+	(void)args;
+	(void)argp;
+	for (;;) {
+		if (g_meta_state != META_PENDING) {
+			sceKernelDelayThread(4000);
+			continue;
+		}
+		char url[600];
+		snprintf(url, sizeof(url), "%s/api/assets/%s", g_server, g_meta_id);
+		membuf buf;
+		long code;
+		CURLcode r = http_request(url, NULL, &buf, &code, NULL, 0);
+		g_meta_date[0] = '\0';
+		g_meta_ratio = 0.0f;
+		g_meta_rot = 0;
+		g_meta_is_video = 0;
+		if (r == CURLE_OK && code >= 200 && code < 300 && buf.data)
+			parse_one_asset(buf.data, buf.size, g_meta_date,
+					sizeof(g_meta_date), &g_meta_ratio,
+					&g_meta_rot, &g_meta_is_video);
+		free(buf.data);
+		__sync_synchronize();
+		g_meta_state = META_DONE;
+	}
+	return 0;
 }
 
 

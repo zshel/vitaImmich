@@ -128,6 +128,9 @@ static unsigned char *g_asset_is_video;
 /* set during display rebuild: a backed-up local file matches this server
  * asset, so its grid cell shows the green "backed up" badge */
 static unsigned char *g_asset_local_backed;
+/* 1 = appended only to back a map-cluster gallery (its id/thumb are needed but
+ * it isn't part of the paged library): shown in the gallery, hidden elsewhere */
+static unsigned char *g_asset_hidden;
 static int g_asset_count;
 static int g_asset_cap;
 static int g_next_page = 1; /* 0 = no more pages */

@@ -112,6 +112,8 @@ static void reset_for_account_change(void)
 	g_next_page = 1;
 	g_search_active = 0;
 	g_search_count = 0;
+	g_gallery_active = 0;
+	g_gallery_count = 0;
 	g_srv_state = 0;   /* re-fetch the cloud page's server info */
 	g_srv_fetching = 0;
 	g_map_state = 0;   /* re-fetch the new account's map markers */
@@ -271,6 +273,11 @@ int main(void)
 					     0x10000100, 256 * 1024, 0, 0, NULL);
 	if (syncw >= 0)
 		sceKernelStartThread(syncw, 0, NULL);
+
+	SceUID metaw = sceKernelCreateThread("meta_worker", meta_worker,
+					     0x10000100, 128 * 1024, 0, 0, NULL);
+	if (metaw >= 0)
+		sceKernelStartThread(metaw, 0, NULL);
 
 	load_autobackup();
 
@@ -482,7 +489,8 @@ int main(void)
 				 * be fetched yet — pull pages until a new month
 				 * shows up (or the library ends). search results
 				 * aren't paginated, so skip the pull. */
-				if (dir > 0 && !g_search_active && can_pull) {
+				if (dir > 0 && !g_search_active &&
+				    !g_gallery_active && can_pull) {
 					int guard = 0;
 					while (g_next_page > 0 && guard++ < 10 &&
 					       !strncmp(disp_date(month_jump(sel, +1)),
@@ -540,7 +548,7 @@ int main(void)
 			 * screen: the grid stays up, the HUD's "+" already says
 			 * more is coming, and the fetch only blocks briefly */
 			if (!scrolling_fast && rl_idle >= 12 && !g_search_active &&
-			    g_next_page > 0 &&
+			    !g_gallery_active && g_next_page > 0 &&
 			    sel >= g_disp_count - COLS * 4) {
 				if (fetch_page(0) > 0)
 					rebuild_keep_view(&sel, &scroll,
@@ -553,6 +561,7 @@ int main(void)
 			 * across the relayout */
 			uint64_t pnow = sceKernelGetProcessTimeWide();
 			if (!scrolling_fast && !touch_active && !g_search_active &&
+			    !g_gallery_active &&
 			    pnow - last_poll > 30ULL * 1000 * 1000) {
 				last_poll = pnow;
 				if (check_new_assets() > 0)
@@ -663,6 +672,21 @@ int main(void)
 							sel = c;
 					}
 				}
+
+				/* in a cluster gallery, O returns to the map; any
+				 * bar action (search/cloud/map) drops the filter */
+				if (g_gallery_active && (pressed & SCE_CTRL_CIRCLE)) {
+					gallery_close();
+					mode = MODE_MAP;
+					sel = 0;
+					scroll = target = 0;
+					grid_last_sel = -1;
+					touch_active = touch_on_bar = 0;
+					continue;
+				}
+				if (g_gallery_active &&
+				    (do_open_cloud || do_open_map || do_search_open))
+					gallery_close();
 
 				if (do_open_cloud) {
 					mode = MODE_CLOUD;
@@ -824,6 +848,12 @@ int main(void)
 				first_vis = 0;
 				last_vis = g_disp_count - 1;
 			}
+
+			/* cluster gallery: resolve members' date/aspect in the
+			 * background so the grid sorts into months + true aspects */
+			if (g_gallery_active)
+				gallery_meta_pump(first_vis, last_vis,
+						  &sel, &scroll, &target);
 
 			/* collect finished download, then hand the worker
 			 * the next most useful thumbnail */
@@ -1070,7 +1100,8 @@ int main(void)
 			}
 			if (pressed & SCE_CTRL_CIRCLE) {
 				/* back to wherever we came from (the map if the
-				 * photo was opened from a marker, else the grid) */
+				 * photo was opened from a marker, else the grid —
+				 * which may be showing a cluster gallery) */
 				mode = detail_from_map ? MODE_MAP : MODE_GRID;
 				detail_from_map = 0;
 				detail_idx = -1;
@@ -1831,6 +1862,7 @@ pf_skip:
 			if (pad.buttons & SCE_CTRL_DOWN)  g_map_cy += pstep;
 			if (pad.buttons & SCE_CTRL_RTRIGGER) g_map_scale *= 1.03;
 			if (pad.buttons & SCE_CTRL_LTRIGGER) g_map_scale /= 1.03;
+			if (pressed & SCE_CTRL_TRIANGLE) g_map_grid = !g_map_grid;
 			map_clamp_view();
 
 			/* touch: one finger drags the map, two fingers pinch-zoom,
@@ -1904,7 +1936,8 @@ pf_skip:
 			else if (tapped_cluster >= 0)
 				act = tapped_cluster;
 			if (act >= 0 && act < g_cl_count) {
-				if (map_should_open(act)) {
+				if (g_cl_n[act] <= 1) {
+					/* a lone marker: open the photo directly */
 					int s;
 					if (map_open_marker(g_cl_rep[act], &s)) {
 						sel = s;
@@ -1918,15 +1951,25 @@ pf_skip:
 						grid_last_sel = -1;
 						continue;
 					}
-					map_zoom_into(act); /* couldn't open: just zoom */
 				} else {
-					map_zoom_into(act);
+					/* a bubble: show all its photos on the grid */
+					g_search_active = 0;
+					gallery_open(act);
+					sel = 0;
+					scroll = target = 0.0f;
+					grid_last_sel = -1;
+					mode = MODE_GRID;
+					continue;
 				}
 			}
 
 			vita2d_start_drawing();
 			vita2d_clear_screen();
+			vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H,
+					      MAP_OCEAN_BG);   /* sea, not black */
 			map_draw_tiles();
+			if (g_map_grid)
+				map_draw_graticule();
 			map_draw_clusters(nc);
 			/* centre crosshair: shows what X will act on */
 			vita2d_draw_rectangle(SCREEN_W / 2.0f - 8, SCREEN_H / 2.0f,
@@ -1940,7 +1983,7 @@ pf_skip:
 				draw_text(12, 28, RGBA8(235, 235, 240, 255), 1.0f, mh);
 				draw_text(12, SCREEN_H - 16,
 					  RGBA8(150, 150, 158, 255), 0.85f,
-					  "d-pad pan   L/R zoom   X open/zoom   O back");
+					  "d-pad pan  L/R zoom  X open  /\\ grid  O back");
 			}
 			vita2d_end_drawing();
 			vita2d_swap_buffers();

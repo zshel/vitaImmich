@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate a Web-Mercator tile pyramid (LODs) from a MapChart world PNG and
+"""Generate a Web-Mercator tile pyramid (LODs) from a world map image and
 pack it into one file for the Vita map view.
 
-The source PNG covers the same cropped-Mercator region as before: longitude
--180..180 across its full width, latitude band [MAP_IMG_MY0, MAP_IMG_MY1].
+The source image covers a cropped-Mercator region: longitude spans its full
+width, latitude band [MAP_IMG_MY0, MAP_IMG_MY1]. The default source carries a
+baked-in 10° graticule, against which those bounds were fit (see map.c).
 Each LOD level is the source scaled to a width, padded to whole 256px tiles,
 and cut up; tiles are JPEG (decoded into pooled textures on device, the safe
 path). Everything goes into assets/maptiles.pak:
@@ -18,12 +19,15 @@ offsets are from the start of the JPEG blob.
 import sys, struct, io
 from PIL import Image
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else '/home/sads/Desktop/MapChart_Map (3).png'
+SRC = sys.argv[1] if len(sys.argv) > 1 else '/home/sads/Desktop/world map cities.jpeg'
 OUT = sys.argv[2] if len(sys.argv) > 2 else '/home/sads/Code/vitaImmich/assets/maptiles.pak'
 TILE = 256
-QUALITY = 90
-# level widths (px) for the full map; last is ~native. heights follow aspect.
-WIDTHS = [512, 1024, 2048, 4096, 7000]
+QUALITY = 94
+# level widths (px). The last entry (10496 ~= 1.5x the 7000px source) is a
+# LANCZOS supersample: it adds no true detail beyond native, but lets a zoomed-in
+# view sample crisp pre-upscaled tiles instead of the GPU bilinear-magnifying the
+# native level, so city labels read sharper. heights follow aspect.
+WIDTHS = [512, 1024, 2048, 4096, 7000, 10496]
 
 src = Image.open(SRC).convert('RGB')
 SW, SH = src.size
@@ -31,8 +35,8 @@ print('source', SW, SH, 'aspect', round(SW/SH, 4))
 
 levels = []   # (imgW,imgH,cols,rows,Image-padded)
 for w in WIDTHS:
-    if w > SW:
-        w = SW
+    if w > 2 * SW:      # allow a modest supersample, but cap runaway upscales
+        w = 2 * SW
     h = round(w * SH / SW)
     img = src.resize((w, h), Image.LANCZOS)
     cols = (w + TILE - 1) // TILE
