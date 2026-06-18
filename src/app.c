@@ -941,6 +941,10 @@ int main(void)
 				draw_centered(SCREEN_H / 2,
 					      RGBA8(160, 160, 165, 255),
 					      "No results");
+			else if (g_gallery_active && g_disp_count == 0)
+				draw_centered(SCREEN_H / 2,
+					      RGBA8(160, 160, 165, 255),
+					      "Loading photos...");
 
 			/* pinned Immich-style search bar, slid up by bar_hidden
 			 * (Square toggles it); covers items up to its lower edge */
@@ -1866,6 +1870,17 @@ pf_skip:
 			if (pad.buttons & SCE_CTRL_DOWN)  g_map_cy += pstep;
 			if (pad.buttons & SCE_CTRL_RTRIGGER) g_map_scale *= 1.03;
 			if (pad.buttons & SCE_CTRL_LTRIGGER) g_map_scale /= 1.03;
+			/* left stick pans (proportional, in screen px), right stick
+			 * up/down zooms — same feel as the detail view */
+			float lsx = (pad.lx - 128) / 128.0f;
+			float lsy = (pad.ly - 128) / 128.0f;
+			if (lsx > 0.15f || lsx < -0.15f)
+				g_map_cx += lsx * 18.0 / g_map_scale;
+			if (lsy > 0.15f || lsy < -0.15f)
+				g_map_cy += lsy * 18.0 / g_map_scale;
+			float rsy = (128 - pad.ry) / 128.0f;   /* up positive = zoom in */
+			if (rsy > 0.18f || rsy < -0.18f)
+				g_map_scale *= 1.0 + rsy * 0.04;
 			if (pressed & SCE_CTRL_TRIANGLE) g_map_grid = !g_map_grid;
 			map_clamp_view();
 

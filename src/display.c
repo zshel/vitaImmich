@@ -176,16 +176,21 @@ static void layout_grid(void)
  * server asset is shown once, as the server asset (green badge). */
 static void rebuild_display(void)
 {
-	/* map cluster gallery: show exactly the selected bubble's members (server
-	 * assets), date-grouped like the timeline. Members whose metadata hasn't
-	 * resolved yet have an empty date and sort to the end until it arrives. */
+	/* map cluster gallery: show the selected bubble's members (server assets),
+	 * date-grouped like the timeline. A member is placed only once its
+	 * date/aspect have resolved, so it drops straight into its final spot
+	 * rather than appearing as an "unknown" placeholder that reflows the whole
+	 * grid when its metadata later arrives. The rest stream in as they load. */
 	if (g_gallery_active) {
 		if (!grow_disp(g_gallery_count > 0 ? g_gallery_count : 1))
 			return;
 		int n = 0;
 		for (int k = 0; k < g_gallery_count; k++) {
+			int idx = g_gallery_idx[k];
+			if (g_asset_dates[idx][0] == '\0')
+				continue;   /* metadata not in yet: not placeable */
 			g_disp[n].src = SRC_SERVER;
-			g_disp[n].idx = g_gallery_idx[k];
+			g_disp[n].idx = idx;
 			n++;
 		}
 		g_disp_count = n;
