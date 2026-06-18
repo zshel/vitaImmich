@@ -312,7 +312,10 @@ static vita2d_texture *icon_tex(int which, int s)
  * drawn tinted; replaces aliased vita2d_draw_fill_circle for UI discs */
 static vita2d_texture *disc_tex(int d)
 {
-	enum { NDISC = 8 };
+	/* keyed by size, no eviction: must be large enough to hold the fixed UI
+	 * disc sizes (face buttons) plus the many cluster-bubble sizes, else a
+	 * button drawn after the bubbles falls back to the aliased fill_circle */
+	enum { NDISC = 24 };
 	static vita2d_texture *cache[NDISC];
 	static int cd[NDISC], n;
 	for (int i = 0; i < n; i++)

@@ -136,6 +136,10 @@ int main(void)
 	 * which can be ~100k vertices when fully zoomed out */
 	vita2d_init_advanced(8 * 1024 * 1024);
 	vita2d_set_clear_color(RGBA8(16, 16, 16, 255));
+	/* pre-cache the face-button disc sizes so they're always anti-aliased,
+	 * even on the map where cluster bubbles otherwise fill the disc cache
+	 * before the buttons draw (see disc_tex) */
+	disc_tex(30); disc_tex(36); disc_tex(38);
 	g_font = vita2d_load_default_pgf();
 	g_ttf = vita2d_load_font_file("app0:font.ttf");
 	g_logo = vita2d_load_PNG_file("app0:logo.png");
@@ -1913,6 +1917,14 @@ pf_skip:
 					}
 				} else {
 					if (touch_active && !touch_dragged) {
+						/* tap on the top-right "Back" + glyph
+						 * returns to the grid */
+						if (touch_x > SCREEN_W - 110 &&
+						    touch_y < 56) {
+							touch_active = 0;
+							mode = MODE_GRID;
+							continue;
+						}
 						tapped_cluster =
 							map_cluster_at(touch_x, touch_y);
 						if (tapped_cluster < 0)
@@ -1981,9 +1993,44 @@ pf_skip:
 				snprintf(mh, sizeof(mh), "Places  -  %d geotagged",
 					 g_map_count);
 				draw_text(12, 28, RGBA8(235, 235, 240, 255), 1.0f, mh);
-				draw_text(12, SCREEN_H - 16,
-					  RGBA8(150, 150, 158, 255), 0.85f,
-					  "d-pad pan  L/R zoom  X open  /\\ grid  O back");
+
+				/* top-right: "Back" label + O glyph, as on other pages */
+				float bkcx = SCREEN_W - 30, bkcy = 36, bkd = 36;
+				int bw = text_width(0.95f, "Back");
+				draw_text(bkcx - bkd / 2 - 8 - bw, bkcy + 6,
+					  RGBA8(220, 220, 225, 255), 0.95f, "Back");
+				draw_ps_button(bkcx, bkcy, bkd, ICON_CIRCLE,
+					       RGBA8(235, 90, 85, 255), 26);
+
+				/* bottom-left: X opens the centred bubble */
+				draw_ps_button(28, SCREEN_H - 22, 30, ICON_CROSS,
+					       RGBA8(120, 160, 235, 255), 22);
+				draw_text(48, SCREEN_H - 16,
+					  RGBA8(220, 220, 225, 255), 0.9f, "Open");
+
+				/* bottom-right: L [zoom%] R (0% = whole world, 100% =
+				 * max zoom). L and R are pinned and the number is
+				 * centred in a fixed slot, so its changing width can't
+				 * shuffle the L/R glyphs around. */
+				int zp = (int)(log(g_map_scale / MAP_SCALE_MIN) /
+					       log(MAP_SCALE_MAX / MAP_SCALE_MIN) *
+					       100.0 + 0.5);
+				if (zp < 0) zp = 0;
+				if (zp > 100) zp = 100;
+				char num[8];
+				snprintf(num, sizeof(num), "%d%%", zp);
+				uint32_t zc = RGBA8(220, 220, 225, 255);
+				float zy = SCREEN_H - 16, zright = SCREEN_W - 12;
+				int wL = text_width(0.9f, "L");
+				int wR = text_width(0.9f, "R");
+				int wMax = text_width(0.9f, "100%");
+				float gap = 10.0f;
+				float zx = zright - (wL + gap + wMax + gap + wR);
+				draw_text(zx, zy, zc, 0.9f, "L");
+				draw_text(zright - wR, zy, zc, 0.9f, "R");
+				int nw = text_width(0.9f, num);
+				float ncx = zx + wL + gap + wMax / 2.0f;
+				draw_text(ncx - nw / 2.0f, zy, zc, 0.9f, num);
 			}
 			vita2d_end_drawing();
 			vita2d_swap_buffers();
