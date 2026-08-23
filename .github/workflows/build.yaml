@@ -1,0 +1,40 @@
+name: Build VPK
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'CMakeLists.txt'
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'CMakeLists.txt'
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # build.sh builds the vitasdk/vitasdk Docker image (Dockerfile in the
+      # repo root: vdpm-installs vita2d/curl/openssl/etc., then cmake) and
+      # copies the resulting VPK to ./build -- same recipe a contributor
+      # would run locally, so CI can't drift from it.
+      - name: Build vitaImmich.vpk
+        run: ./build.sh
+
+      - name: Upload VPK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitaImmich-vpk
+          path: build/vitaImmich.vpk
+          if-no-files-found: error
