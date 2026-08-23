@@ -42,7 +42,8 @@ handheld.
 
 - A PS Vita running **HENkaku/h‑encore** with **VitaShell**.
 - A reasonably recent **Immich server** reachable over the Vita's Wi‑Fi.
-- An **Immich API key** (web UI → *Account Settings → API Keys*), or an email/password.
+- An **Immich API key** (web UI → *Account Settings → API Keys*), an
+  email/password, or **OAuth** (if your server has it enabled).
 
 ## 🚀 Install & configure
 
@@ -65,7 +66,39 @@ handheld.
    serverip=192.168.1.100
    ```
 
-4. Relaunch.
+4. Relaunch. If `apikey`/`email`+`password` are left blank, the app drops to
+   an interactive sign-in screen — pick **Log in with OAuth** there instead
+   of typing credentials into `config.txt`.
+
+### 🔐 Signing in with OAuth
+
+The Vita has no browser this app can drive, so OAuth is a **manual
+authorization-code** flow rather than a one-tap redirect:
+
+1. On the sign‑in screen, select **Log in with OAuth**. The app asks the
+   server for your identity provider's authorization URL (standard
+   authorization‑code + PKCE, via Immich's `/api/oauth/authorize` and
+   `/api/oauth/callback`).
+2. Open that address on *any* device with a real browser (phone, PC) and
+   sign in.
+3. The provider redirects to a page that either fails to load or shows an
+   "open in app?" prompt — either way, its address bar now has a `code=`
+   value in it. Come back to the Vita, choose **Enter code / URL**, and type
+   (or paste, if your device and the Vita can share a clipboard) either that
+   code or the whole address.
+4. The Vita exchanges it for a session and you're in. The session token is
+   saved to `config.txt` (`token=`) so you don't have to repeat this on every
+   launch — only when the session eventually expires or is revoked.
+
+By default the redirect URI sent to your provider is the server's own
+`/api/oauth/mobile-redirect` passthrough — the same one self-hosters
+typically already allow for the official Immich mobile app, so this usually
+needs no extra provider-side setup. If your provider rejects it, register
+your own redirect URI and set it in `config.txt`:
+
+```ini
+oauth_redirect=https://your-registered-redirect/uri
+```
 
 ## 🎮 Controls
 
@@ -142,6 +175,11 @@ Tunables in `config.txt`: `syncdir=<folder>` (repeatable) and `syncmaxmb=<MB>`
 
 - **TLS verification is disabled** (no CA bundle ships) — prefer plain HTTP on a
   trusted LAN, or treat HTTPS as unverified.
+- **OAuth sign-in is manual**: the Vita has no browser this app can drive, so
+  you complete the identity provider's login on another device and type the
+  resulting code back in. If a saved OAuth session (`token=` in config.txt)
+  is later revoked or expires, delete that line to drop back to the sign-in
+  screen on next launch.
 - Videos download in full to the memory card before playing (deleted after).
   Playback is the Vita's hardware decoder via SceAvPlayer, so only **MP4
   (H.264/AAC)** plays — Immich's transcoded `video/playback` stream is used.

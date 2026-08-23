@@ -32,10 +32,15 @@ static int load_config(void)
 		f = fopen(CONFIG_PATH, "w");
 		if (f) {
 			fputs("server=https://demo.immich.app\n"
-			      "# auth: an API key, OR an email + password login.\n"
+			      "# auth: an API key, an email + password login, OR\n"
+			      "# OAuth -- pick 'Log in with OAuth' on the sign-in\n"
+			      "# screen (server needs OAuth enabled).\n"
 			      "apikey=\n"
 			      "email=demo@immich.app\n"
 			      "password=demo\n"
+			      "# oauth_redirect=  (optional: overrides the OAuth\n"
+			      "#  redirectUri; default is <server>/api/oauth/\n"
+			      "#  mobile-redirect)\n"
 			      "# serverip=192.168.1.100  (optional: LAN IP of the\n"
 			      "#  server, for routers without NAT loopback)\n"
 			      "# syncdir=ux0:picture  (optional, repeatable: folders\n"
@@ -73,6 +78,11 @@ static int load_config(void)
 			snprintf(g_password, sizeof(g_password), "%s", clean_line(s + 9));
 		else if (!strncmp(s, "serverip=", 9))
 			snprintf(g_serverip, sizeof(g_serverip), "%s", clean_line(s + 9));
+		else if (!strncmp(s, "oauth_redirect=", 15))
+			snprintf(g_oauth_redirect, sizeof(g_oauth_redirect), "%s",
+				 clean_line(s + 15));
+		else if (!strncmp(s, "token=", 6))
+			snprintf(g_token, sizeof(g_token), "%s", clean_line(s + 6));
 		else if (!strncmp(s, "syncdir=", 8)) {
 			if (g_syncdir_count < (int)(sizeof(g_syncdirs) /
 						    sizeof(g_syncdirs[0]))) {
@@ -97,12 +107,14 @@ static int load_config(void)
 	if (n > 0 && g_server[n - 1] == '/')
 		g_server[n - 1] = '\0';
 
-	/* need a server and either an API key or an email+password login */
+	/* need a server and either an API key, an email+password login, or a
+	 * saved OAuth session token */
 	if (strstr(g_apikey, "PASTE_YOUR"))
 		g_apikey[0] = '\0';
 	int have_key = g_apikey[0] != '\0';
 	int have_login = g_email[0] && g_password[0];
-	if (!g_server[0] || (!have_key && !have_login))
+	int have_token = g_token[0] != '\0';
+	if (!g_server[0] || (!have_key && !have_login && !have_token))
 		return -1;
 
 	/* default to http:// when no scheme is given */

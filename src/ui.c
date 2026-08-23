@@ -580,6 +580,10 @@ static void save_config(void)
 	fprintf(f, "apikey=%s\n", g_apikey);
 	if (g_email[0])    fprintf(f, "email=%s\n", g_email);
 	if (g_password[0]) fprintf(f, "password=%s\n", g_password);
+	/* OAuth has no password to redo the login with, so its session token is
+	 * the credential that gets saved instead */
+	if (g_token[0] && !g_email[0]) fprintf(f, "token=%s\n", g_token);
+	if (g_oauth_redirect[0]) fprintf(f, "oauth_redirect=%s\n", g_oauth_redirect);
 	if (g_serverip[0]) fprintf(f, "serverip=%s\n", g_serverip);
 	for (int i = 0; i < g_syncdir_count; i++)
 		fprintf(f, "syncdir=%s\n", g_syncdirs[i]);
@@ -601,17 +605,143 @@ static void normalize_server(void)
 	}
 }
 
-/* interactive sign-in: server + email + password via the on-screen keyboard.
- * blocks until a login succeeds, then saves the config. */
+/* interactive OAuth sign-in: fetches the identity provider's authorization
+ * URL from the server and lets the user paste back either the short "code"
+ * value or the whole callback URL once they've completed the login
+ * somewhere with a real browser (the Vita has none this app can drive).
+ * blocks. returns 1 and leaves the session token in g_token on success; 0
+ * otherwise (err is left empty if the user simply cancelled, set to a
+ * message on failure). */
+static int oauth_login_flow(char *err, size_t errlen, unsigned int frame)
+{
+	err[0] = '\0';
+
+	char redirect[300];
+	oauth_redirect_uri(redirect, sizeof(redirect));
+
+	static char auth_url[1024];
+	static char state[64];
+	static char verifier[128];
+	draw_loading("Starting OAuth...", frame);
+	if (oauth_authorize(auth_url, sizeof(auth_url), state, sizeof(state),
+			    verifier, sizeof(verifier), err, errlen) != 0)
+		return 0;
+
+	int sel = 0;               /* 0 = enter code/URL, 1 = cancel */
+	static char input[512];
+	char suberr[160] = "";
+	unsigned int prev = 0;
+	const float fx = 60, fw = 840, fh = 40, by = 380, cy = 430;
+	int t_down = 0, t_drag = 0;
+	float t_x = 0, t_y = 0, t_sx = 0, t_sy = 0;
+	for (;;) {
+		SceCtrlData pad;
+		sceCtrlPeekBufferPositive(0, &pad, 1);
+		unsigned int pressed = pad.buttons & ~prev;
+		prev = pad.buttons;
+		frame++;
+
+		if (pressed & (SCE_CTRL_UP | SCE_CTRL_DOWN)) sel ^= 1;
+		if (pressed & SCE_CTRL_CIRCLE)
+			return 0;
+
+		int activate = (pressed & SCE_CTRL_CROSS) ? sel : -1;
+		{
+			SceTouchData td;
+			sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1);
+			if (td.reportNum > 0) {
+				float tx = td.report[0].x * 0.5f;
+				float ty = td.report[0].y * 0.5f;
+				if (!t_down) {
+					t_down = 1;
+					t_drag = 0;
+					t_sx = tx;
+					t_sy = ty;
+				} else if (fabsf(tx - t_sx) > 14 ||
+					   fabsf(ty - t_sy) > 14) {
+					t_drag = 1;
+				}
+				t_x = tx;
+				t_y = ty;
+			} else if (t_down) {
+				t_down = 0;
+				if (!t_drag && t_x >= fx && t_x <= fx + fw) {
+					if (t_y >= by && t_y <= by + fh) {
+						sel = 0;
+						activate = 0;
+					} else if (t_y >= cy && t_y <= cy + fh) {
+						sel = 1;
+						activate = 1;
+					}
+				}
+			}
+		}
+
+		if (activate == 1)
+			return 0; /* Cancel */
+		if (activate == 0) {
+			if (ime_input("Code (or full callback URL)", input,
+				      input, sizeof(input), 0) && input[0]) {
+				draw_loading("Signing in...", frame);
+				if (oauth_exchange(redirect, state, verifier,
+						   input, suberr,
+						   sizeof(suberr)) == 0)
+					return 1;
+			}
+			prev = 0xFFFFFFFF;
+			t_down = 0;
+			continue;
+		}
+
+		vita2d_start_drawing();
+		vita2d_clear_screen();
+		draw_centered(40, RGBA8(255, 255, 255, 255), "Sign in with OAuth");
+		int y = draw_centered_wrapped(70, RGBA8(190, 190, 198, 255),
+			"The Vita has no browser this app can drive. Open the "
+			"address below on any phone or computer, sign in, then "
+			"come back and enter the \"code\" from the page it lands "
+			"on (or paste the whole address).",
+			860, 20);
+		draw_centered(y + 12, RGBA8(150, 150, 158, 255), "Address:");
+		draw_centered_wrapped(y + 34, RGBA8(140, 170, 250, 255),
+				      auth_url, 860, 20);
+
+		vita2d_texture *eb = rounded_mask_tex((int)fw, (int)fh, 10.0f);
+		if (eb)
+			vita2d_draw_texture_tint(eb, fx, by,
+				sel == 0 ? RGBA8(94, 110, 215, 255)
+					 : RGBA8(38, 38, 42, 255));
+		draw_centered((int)by + 26, RGBA8(245, 245, 250, 255),
+			      "Enter code / URL");
+
+		vita2d_texture *cb = rounded_mask_tex((int)fw, (int)fh, 10.0f);
+		if (cb)
+			vita2d_draw_texture_tint(cb, fx, cy,
+				sel == 1 ? RGBA8(94, 110, 215, 255)
+					 : RGBA8(38, 38, 42, 255));
+		draw_centered((int)cy + 26, RGBA8(210, 210, 218, 255), "Cancel");
+
+		if (suberr[0])
+			draw_centered(SCREEN_H - 20, RGBA8(220, 120, 120, 255),
+				      suberr);
+		vita2d_end_drawing();
+		vita2d_swap_buffers();
+		sceDisplayWaitVblankStart();
+	}
+}
+
+/* interactive sign-in: server + email + password via the on-screen keyboard,
+ * or OAuth. blocks until a login succeeds, then saves the config. */
 static void login_screen(void)
 {
-	int sel = 0;          /* 0 server, 1 email, 2 password, 3 log in, 4 demo */
+	int sel = 0;    /* 0 server, 1 email, 2 password, 3 log in, 4 demo, 5 oauth */
 	char errmsg[160] = "";
 	unsigned int prev = 0, frame = 0;
 	/* field / button geometry, shared by the touch hit-test and the drawer */
-	const float fx = 180, fw = 600, fh = 44, row0 = 200, rowgap = 58;
-	const float by = row0 + 3 * rowgap + 6;   /* Log in button */
-	const float dy = by + fh + 12;            /* Try demo button */
+	const float fx = 180, fw = 600, fh = 40, row0 = 186, rowgap = 50;
+	const float by = row0 + 3 * rowgap + 4;   /* Log in button */
+	const float dy = by + fh + 8;             /* Try demo button */
+	const float ey = dy + fh + 8;             /* Log in with OAuth button */
 	int lt_down = 0, lt_drag = 0;
 	float lt_x = 0, lt_y = 0, lt_sx = 0, lt_sy = 0;
 	for (;;) {
@@ -621,8 +751,8 @@ static void login_screen(void)
 		prev = pad.buttons;
 		frame++;
 
-		if (pressed & SCE_CTRL_UP)   sel = (sel + 4) % 5;
-		if (pressed & SCE_CTRL_DOWN) sel = (sel + 1) % 5;
+		if (pressed & SCE_CTRL_UP)   sel = (sel + 5) % 6;
+		if (pressed & SCE_CTRL_DOWN) sel = (sel + 1) % 6;
 
 		/* activate an item with X, or by tapping it on the touchscreen */
 		int activate = (pressed & SCE_CTRL_CROSS) ? sel : -1;
@@ -659,6 +789,9 @@ static void login_screen(void)
 					} else if (lt_y >= dy && lt_y <= dy + fh) {
 						sel = 4;
 						activate = 4;
+					} else if (lt_y >= ey && lt_y <= ey + fh) {
+						sel = 5;
+						activate = 5;
 					}
 				}
 			}
@@ -675,6 +808,23 @@ static void login_screen(void)
 			} else if (activate == 2) {
 				ime_input("Password", g_password, g_password,
 					  sizeof(g_password), 1);
+			} else if (activate == 5) {
+				g_token[0] = g_apikey[0] = '\0';
+				normalize_server();
+				if (!g_server[0]) {
+					snprintf(errmsg, sizeof(errmsg),
+						 "Enter a server first");
+				} else {
+					char oerr[160];
+					if (oauth_login_flow(oerr, sizeof(oerr),
+							     frame)) {
+						save_config();
+						return;
+					}
+					if (oerr[0])
+						snprintf(errmsg, sizeof(errmsg),
+							 "%s", oerr);
+				}
 			} else {
 				/* activate 4 = Try demo: prefill the public demo */
 				if (activate == 4) {
@@ -771,6 +921,20 @@ static void login_screen(void)
 			vita2d_draw_texture_tint(dbn, fx, dy, RGBA8(50, 52, 60, 255));
 		draw_centered((int)dy + 30, RGBA8(210, 210, 218, 255),
 			      "Try demo");
+
+		/* Log in with OAuth button */
+		if (sel == 5) {
+			vita2d_texture *r = rounded_mask_tex((int)fw + 6,
+							     (int)fh + 6, 13.0f);
+			if (r)
+				vita2d_draw_texture_tint(r, fx - 3, ey - 3,
+							 RGBA8(120, 140, 235, 255));
+		}
+		vita2d_texture *ob = rounded_mask_tex((int)fw, (int)fh, 10.0f);
+		if (ob)
+			vita2d_draw_texture_tint(ob, fx, ey, RGBA8(50, 52, 60, 255));
+		draw_centered((int)ey + 26, RGBA8(210, 210, 218, 255),
+			      "Log in with OAuth");
 
 		if (errmsg[0])
 			draw_centered(SCREEN_H - 46, RGBA8(220, 120, 120, 255),

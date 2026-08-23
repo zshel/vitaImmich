@@ -21,6 +21,7 @@
 #include <math.h>
 #include <setjmp.h>
 #include <malloc.h>
+#include <ctype.h>
 
 #include <psp2/appmgr.h>
 #include <psp2/audioout.h>
@@ -30,6 +31,7 @@
 #include <psp2/touch.h>
 #include <psp2/gxm.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/rng.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/io/dirent.h>
@@ -84,6 +86,12 @@ static char g_serverip[64];
 static char g_email[128];
 static char g_password[128];
 static char g_token[256];
+/* OAuth: redirectUri override for /api/oauth/authorize (config oauth_redirect=;
+ * defaults to the server's own /api/oauth/mobile-redirect passthrough, which
+ * self-hosters typically already allow with their identity provider for the
+ * official mobile app). g_token doubles as the OAuth session token and is
+ * persisted (config token=) since there is no password to redo the login with. */
+static char g_oauth_redirect[256];
 /* optional DNS pin ("host:port:ip") for routers without NAT loopback */
 static struct curl_slist *g_resolve_list;
 

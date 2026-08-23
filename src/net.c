@@ -293,6 +293,203 @@ static int do_login(char *err, size_t errlen)
 	return 0;
 }
 
+/* ---- OAuth (authorization-code + PKCE) ------------------------------ */
+
+/* base64url, no padding (RFC 4648 sec. 5): what Immich's OAuth endpoints
+ * want for the PKCE code_verifier/code_challenge and our own state token */
+static void b64url_encode(const unsigned char *in, size_t inlen,
+			  char *out, size_t outsz)
+{
+	static const char tbl[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	size_t o = 0;
+	for (size_t i = 0; i < inlen && o + 4 < outsz; i += 3) {
+		unsigned int v = (unsigned int)in[i] << 16;
+		int n = 1;
+		if (i + 1 < inlen) { v |= (unsigned int)in[i + 1] << 8; n = 2; }
+		if (i + 2 < inlen) { v |= in[i + 2];                    n = 3; }
+		out[o++] = tbl[(v >> 18) & 0x3F];
+		out[o++] = tbl[(v >> 12) & 0x3F];
+		if (n > 1) out[o++] = tbl[(v >> 6) & 0x3F];
+		if (n > 2) out[o++] = tbl[v & 0x3F];
+	}
+	out[o] = '\0';
+}
+
+/* a base64url-encoded random string with `nbytes` of entropy behind it */
+static void rand_b64url(char *out, size_t outsz, int nbytes)
+{
+	unsigned char raw[64];
+	if (nbytes > (int)sizeof(raw))
+		nbytes = sizeof(raw);
+	sceKernelGetRandomNumber(raw, nbytes);
+	b64url_encode(raw, nbytes, out, outsz);
+}
+
+/* percent-encode a URL query value (RFC 3986 unreserved chars pass through) */
+static void url_encode(const char *in, char *out, size_t outsz)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	size_t o = 0;
+	for (const unsigned char *p = (const unsigned char *)in;
+	     *p && o + 4 < outsz; p++) {
+		if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+			out[o++] = (char)*p;
+		} else {
+			out[o++] = '%';
+			out[o++] = hex[*p >> 4];
+			out[o++] = hex[*p & 0xF];
+		}
+	}
+	out[o] = '\0';
+}
+
+/* JSON-escape `src` into `dst` (quotes/backslashes/control chars) */
+static void json_escape(char *dst, size_t dstsz, const char *src)
+{
+	size_t o = 0;
+	for (const unsigned char *p = (const unsigned char *)src;
+	     *p && o + 2 < dstsz; p++) {
+		if (*p == '"' || *p == '\\') {
+			dst[o++] = '\\';
+			dst[o++] = (char)*p;
+		} else if (*p >= 0x20) {
+			dst[o++] = (char)*p;
+		}
+	}
+	dst[o] = '\0';
+}
+
+/* the redirect URI OAuth callbacks are sent to: the config override, or
+ * Immich's own /api/oauth/mobile-redirect passthrough. Self-hosters who have
+ * already set up OAuth for the official mobile app typically allow this
+ * exact URI with their identity provider already (it's how Immich bridges a
+ * plain https(s) redirect to the app.immich:// deep link), so it works with
+ * no extra admin setup for most servers. */
+static void oauth_redirect_uri(char *out, size_t outsz)
+{
+	if (g_oauth_redirect[0])
+		snprintf(out, outsz, "%s", g_oauth_redirect);
+	else
+		snprintf(out, outsz, "%s/api/oauth/mobile-redirect", g_server);
+}
+
+/* start an OAuth login: ask the server for the identity provider's
+ * authorization URL (POST /api/oauth/authorize). Fills `url` (open it in a
+ * browser -- the Vita doesn't have one this app can drive) and `state`/
+ * `verifier`, which must be replayed to oauth_exchange() below once the
+ * provider has redirected back. returns 0 on success. */
+static int oauth_authorize(char *url, size_t urlsz, char *state,
+			   size_t statesz, char *verifier, size_t versz,
+			   char *err, size_t errlen)
+{
+	char redirect[300];
+	oauth_redirect_uri(redirect, sizeof(redirect));
+
+	rand_b64url(state, statesz, 16);
+	rand_b64url(verifier, versz, 32);
+
+	unsigned char digest[SHA256_DIGEST_LENGTH];
+	SHA256((const unsigned char *)verifier, strlen(verifier), digest);
+	char challenge[64];
+	b64url_encode(digest, sizeof(digest), challenge, sizeof(challenge));
+
+	char redirect_esc[400], state_esc[64], challenge_esc[96];
+	json_escape(redirect_esc, sizeof(redirect_esc), redirect);
+	json_escape(state_esc, sizeof(state_esc), state);
+	json_escape(challenge_esc, sizeof(challenge_esc), challenge);
+
+	char body[900];
+	snprintf(body, sizeof(body),
+		 "{\"redirectUri\":\"%s\",\"state\":\"%s\",\"codeChallenge\":\"%s\"}",
+		 redirect_esc, state_esc, challenge_esc);
+
+	char reqUrl[600];
+	snprintf(reqUrl, sizeof(reqUrl), "%s/api/oauth/authorize", g_server);
+	membuf buf;
+	long code;
+	CURLcode r = http_request(reqUrl, body, &buf, &code, NULL, 0);
+	if (r != CURLE_OK) {
+		snprintf(err, errlen, "%s", curl_easy_strerror(r));
+		free(buf.data);
+		return -1;
+	}
+	if (code < 200 || code >= 300) {
+		snprintf(err, errlen, "HTTP %ld: %.80s", code,
+			 buf.data ? buf.data : "");
+		free(buf.data);
+		return -1;
+	}
+	if (!buf.data || !json_get(buf.data, buf.size, "url", url, urlsz)) {
+		snprintf(err, errlen, "no authorize url in response");
+		free(buf.data);
+		return -1;
+	}
+	free(buf.data);
+	log_line("oauth authorize url: %.200s", url);
+	return 0;
+}
+
+/* finish an OAuth login: exchange the identity provider's callback for a
+ * session token (POST /api/oauth/callback), stashed in g_token like
+ * do_login(). `input` is either the full callback URL the user landed on
+ * (contains "://"), or just its "code" value -- reconstructed here into a
+ * callback URL using the redirect URI + state this login started with, so
+ * the user only has to retype the short code. returns 0 on success. */
+static int oauth_exchange(const char *redirect, const char *state,
+			  const char *verifier, const char *input,
+			  char *err, size_t errlen)
+{
+	/* input comes from the IME dialog (max 128 UTF-16 chars) but every byte
+	 * can percent-encode to 3, so code_enc needs headroom well past 128*3 */
+	char cburl[1400];
+	if (strstr(input, "://")) {
+		snprintf(cburl, sizeof(cburl), "%s", input);
+	} else {
+		char code_enc[420], state_enc[96];
+		url_encode(input, code_enc, sizeof(code_enc));
+		url_encode(state, state_enc, sizeof(state_enc));
+		snprintf(cburl, sizeof(cburl), "%s?code=%s&state=%s",
+			 redirect, code_enc, state_enc);
+	}
+
+	char url_esc[1024], state_esc[64], verifier_esc[128];
+	json_escape(url_esc, sizeof(url_esc), cburl);
+	json_escape(state_esc, sizeof(state_esc), state);
+	json_escape(verifier_esc, sizeof(verifier_esc), verifier);
+
+	char body[1400];
+	snprintf(body, sizeof(body),
+		 "{\"url\":\"%s\",\"state\":\"%s\",\"codeVerifier\":\"%s\"}",
+		 url_esc, state_esc, verifier_esc);
+
+	char reqUrl[600];
+	snprintf(reqUrl, sizeof(reqUrl), "%s/api/oauth/callback", g_server);
+	membuf buf;
+	long code;
+	CURLcode r = http_request(reqUrl, body, &buf, &code, NULL, 0);
+	if (r != CURLE_OK) {
+		snprintf(err, errlen, "%s", curl_easy_strerror(r));
+		free(buf.data);
+		return -1;
+	}
+	if (code < 200 || code >= 300) {
+		snprintf(err, errlen, "HTTP %ld: %.80s", code,
+			 buf.data ? buf.data : "");
+		free(buf.data);
+		return -1;
+	}
+	if (!buf.data || !json_get(buf.data, buf.size, "accessToken",
+				   g_token, sizeof(g_token))) {
+		snprintf(err, errlen, "no accessToken in response");
+		free(buf.data);
+		return -1;
+	}
+	free(buf.data);
+	log_line("oauth login ok: token %.8s...", g_token);
+	return 0;
+}
+
 /* GET a JSON endpoint, trying the modern path then a legacy fallback. fills
  * `out`/`code`; caller frees out->data. returns CURLcode of the call used. */
 static CURLcode server_get(const char *path, const char *legacy,
