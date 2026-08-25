@@ -605,13 +605,64 @@ static void normalize_server(void)
 	}
 }
 
+/* renders `text` as a QR Code (via the vendored qrcodegen) into a cached
+ * texture: black modules on white, with the standard 4-module quiet zone,
+ * so a phone camera can find and decode it reliably regardless of what the
+ * app draws behind it. keyed by string content — single slot, since the
+ * OAuth screen only ever shows one address at a time. */
+static vita2d_texture *qr_tex_for(const char *text)
+{
+	static vita2d_texture *cache;
+	static char cache_text[1024];
+
+	if (cache && !strcmp(cache_text, text))
+		return cache;
+
+	static uint8_t qr[qrcodegen_BUFFER_LEN_MAX];
+	static uint8_t tmp[qrcodegen_BUFFER_LEN_MAX];
+	if (!qrcodegen_encodeText(text, tmp, qr, qrcodegen_Ecc_LOW,
+				  qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+				  qrcodegen_Mask_AUTO, true))
+		return NULL;
+
+	int size = qrcodegen_getSize(qr);
+	const int scale = 4;   /* raw px per module, before GPU minification */
+	const int quiet = 4;   /* modules of white border (spec minimum) */
+	int dim = (size + quiet * 2) * scale;
+
+	vita2d_texture *t = vita2d_create_empty_texture_format(dim, dim,
+		SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+	if (!t)
+		return NULL;
+	uint32_t *data = vita2d_texture_get_datap(t);
+	int stride = (int)(vita2d_texture_get_stride(t) / 4);
+	const uint32_t white = RGBA8(255, 255, 255, 255);
+	const uint32_t black = RGBA8(0, 0, 0, 255);
+	for (int y = 0; y < dim; y++) {
+		int my = y / scale - quiet;
+		for (int x = 0; x < dim; x++) {
+			int mx = x / scale - quiet;
+			int dark = mx >= 0 && mx < size && my >= 0 && my < size &&
+				   qrcodegen_getModule(qr, mx, my);
+			data[y * stride + x] = dark ? black : white;
+		}
+	}
+
+	if (cache) {
+		vita2d_wait_rendering_done();
+		vita2d_free_texture(cache);
+	}
+	cache = t;
+	snprintf(cache_text, sizeof(cache_text), "%s", text);
+	return cache;
+}
+
 /* interactive OAuth sign-in: fetches the identity provider's authorization
  * URL from the server and lets the user paste back either the short "code"
  * value or the whole callback URL once they've completed the login
- * somewhere with a real browser (the Vita has none this app can drive).
- * blocks. returns 1 and leaves the session token in g_token on success; 0
- * otherwise (err is left empty if the user simply cancelled, set to a
- * message on failure). */
+ * somewhere else. blocks. returns 1 and leaves the session token in g_token
+ * on success; 0 otherwise (err is left empty if the user simply cancelled,
+ * set to a message on failure). */
 static int oauth_login_flow(char *err, size_t errlen, unsigned int frame)
 {
 	err[0] = '\0';
@@ -696,15 +747,25 @@ static int oauth_login_flow(char *err, size_t errlen, unsigned int frame)
 		vita2d_start_drawing();
 		vita2d_clear_screen();
 		draw_centered(40, RGBA8(255, 255, 255, 255), "Sign in with OAuth");
-		int y = draw_centered_wrapped(70, RGBA8(190, 190, 198, 255),
-			"The Vita has no browser this app can drive. Open the "
-			"address below on any phone or computer, sign in, then "
-			"come back and enter the \"code\" from the page it lands "
-			"on (or paste the whole address).",
-			860, 20);
-		draw_centered(y + 12, RGBA8(150, 150, 158, 255), "Address:");
-		draw_centered_wrapped(y + 34, RGBA8(140, 170, 250, 255),
-				      auth_url, 860, 20);
+		draw_centered(76, RGBA8(190, 190, 198, 255),
+			"To continue signing in, please use another device.");
+
+		/* QR code on the left, sized generously so its modules stay
+		 * scannable from a phone camera; the address wrapped to its
+		 * own column on the right so a long URL wraps onto multiple
+		 * lines instead of running off the screen. */
+		const int qr_x = 60, qr_y = 108, qr_dim = 210;
+		vita2d_texture *qr = qr_tex_for(auth_url);
+		if (qr) {
+			float s = (float)qr_dim / vita2d_texture_get_width(qr);
+			vita2d_draw_texture_scale(qr, (float)qr_x, (float)qr_y, s, s);
+		}
+
+		const int col_x = 300, col_w = 900 - 300;
+		draw_text((float)col_x, 112.0f, RGBA8(150, 150, 158, 255), 1.0f,
+			  "Address:");
+		draw_left_wrapped(col_x, 136, RGBA8(140, 170, 250, 255),
+				  auth_url, col_w, 22);
 
 		vita2d_texture *eb = rounded_mask_tex((int)fw, (int)fh, 10.0f);
 		if (eb)
