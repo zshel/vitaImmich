@@ -72,15 +72,15 @@ handheld.
 
 ### 🔐 Signing in with OAuth
 
-The Vita has no browser this app can drive, so OAuth is a **manual
-authorization-code** flow rather than a one-tap redirect:
+OAuth is a **manual authorization-code** flow rather than a one-tap redirect —
+you continue login on another device:
 
 1. On the sign‑in screen, select **Log in with OAuth**. The app asks the
    server for your identity provider's authorization URL (standard
    authorization‑code + PKCE, via Immich's `/api/oauth/authorize` and
    `/api/oauth/callback`).
-2. Open that address on *any* device with a real browser (phone, PC) and
-   sign in.
+2. On *any* other device, either scan the on-screen QR code or open the
+   wrapped address by hand, then sign in.
 3. The provider redirects to a page that either fails to load or shows an
    "open in app?" prompt — either way, its address bar now has a `code=`
    value in it. Come back to the Vita, choose **Enter code / URL**, and type
@@ -175,8 +175,8 @@ Tunables in `config.txt`: `syncdir=<folder>` (repeatable) and `syncmaxmb=<MB>`
 
 - **TLS verification is disabled** (no CA bundle ships) — prefer plain HTTP on a
   trusted LAN, or treat HTTPS as unverified.
-- **OAuth sign-in is manual**: the Vita has no browser this app can drive, so
-  you complete the identity provider's login on another device and type the
+- **OAuth sign-in is manual**: you complete the identity provider's login on
+  another device (scan the QR code or open the address shown) and type the
   resulting code back in. If a saved OAuth session (`token=` in config.txt)
   is later revoked or expires, delete that line to drop back to the sign-in
   screen on next launch.

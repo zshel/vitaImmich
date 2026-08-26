@@ -64,12 +64,15 @@ static void draw_centered(int y, uint32_t color, const char *text)
 	draw_text((SCREEN_W - w) / 2, y, color, 1.0f, text);
 }
 
-/* draw `text` centered and word-wrapped so no line exceeds maxw pixels,
- * stacking lines line_h px apart. honours explicit '\n' as a hard break.
- * returns the y just past the last line drawn. used by the error screens,
- * whose messages used to be one centered line that ran off both edges. */
-static int draw_centered_wrapped(int y, uint32_t color, const char *text,
-				 int maxw, int line_h)
+/* word-wraps `text` so no line exceeds maxw pixels, stacking lines line_h px
+ * apart, and commits each finished line via `emit(y, line, ctx)` (centered,
+ * or flush-left at a fixed x, depending on what the caller put in ctx).
+ * honours explicit '\n' as a hard break. a single "word" longer than maxw
+ * (e.g. a URL with no spaces to break on) is itself split at the character
+ * that would overflow, so it wraps onto as many lines as needed instead of
+ * running off the screen. returns the y just past the last line drawn. */
+static int wrap_lines(int y, const char *text, int maxw, int line_h,
+		      void (*emit)(int y, const char *line, void *ctx), void *ctx)
 {
 	char line[256];
 	line[0] = '\0';
@@ -84,37 +87,97 @@ static int draw_centered_wrapped(int y, uint32_t color, const char *text,
 		int forced_nl = (*p == '\n');
 		int end = (*p == '\0');
 
-		if (wlen > 0) {
+		int consumed = 0;
+		while (consumed < wlen) {
+			int remain = wlen - consumed;
 			char cand[256];
 			if (line[0])
-				snprintf(cand, sizeof(cand), "%s %.*s", line, wlen, w);
+				snprintf(cand, sizeof(cand), "%s %.*s", line,
+					 remain, w + consumed);
 			else
-				snprintf(cand, sizeof(cand), "%.*s", wlen, w);
-			/* place the word if it fits, or if the line is empty (a
-			 * single over-long word goes on its own line rather than
-			 * looping forever) */
-			if (!line[0] || text_width(1.0f, cand) <= maxw) {
+				snprintf(cand, sizeof(cand), "%.*s",
+					 remain, w + consumed);
+			if (text_width(1.0f, cand) <= maxw) {
 				snprintf(line, sizeof(line), "%s", cand);
-			} else {
-				draw_centered(y, color, line);
+				break;
+			}
+			if (line[0]) {
+				/* doesn't fit appended; flush and retry this
+				 * same remaining chunk on a fresh line */
+				emit(y, line, ctx);
 				y += line_h;
-				snprintf(line, sizeof(line), "%.*s", wlen, w);
+				line[0] = '\0';
+				continue;
+			}
+			/* an empty line still can't fit `remain`: binary-search
+			 * the longest character prefix that does, so an
+			 * over-long word (or its tail) wraps mid-word */
+			int lo = 1, hi = remain;
+			while (lo < hi) {
+				int mid = (lo + hi + 1) / 2;
+				char probe[256];
+				snprintf(probe, sizeof(probe), "%.*s",
+					 mid, w + consumed);
+				if (text_width(1.0f, probe) <= maxw)
+					lo = mid;
+				else
+					hi = mid - 1;
+			}
+			snprintf(line, sizeof(line), "%.*s", lo, w + consumed);
+			consumed += lo;
+			if (consumed < wlen) {
+				emit(y, line, ctx);
+				y += line_h;
+				line[0] = '\0';
 			}
 		}
 		if (forced_nl) {
-			draw_centered(y, color, line);
+			emit(y, line, ctx);
 			y += line_h;
 			line[0] = '\0';
 			p++;             /* consume the '\n' */
 		}
 		if (end) {
 			if (line[0]) {
-				draw_centered(y, color, line);
+				emit(y, line, ctx);
 				y += line_h;
 			}
 			return y;
 		}
 	}
+}
+
+struct wrap_style {
+	uint32_t color;
+	int x;          /* ignored when centered */
+	int centered;
+};
+
+static void wrap_emit(int y, const char *line, void *ctx)
+{
+	struct wrap_style *s = ctx;
+	if (s->centered)
+		draw_centered(y, s->color, line);
+	else
+		draw_text((float)s->x, (float)y, s->color, 1.0f, line);
+}
+
+/* draw `text` centered and word-wrapped so no line exceeds maxw pixels;
+ * see wrap_lines(). used by the error screens and the OAuth login screen. */
+static int draw_centered_wrapped(int y, uint32_t color, const char *text,
+				 int maxw, int line_h)
+{
+	struct wrap_style s = { color, 0, 1 };
+	return wrap_lines(y, text, maxw, line_h, wrap_emit, &s);
+}
+
+/* draw `text` flush-left at x, word-wrapped so no line exceeds maxw pixels;
+ * see wrap_lines(). used for the OAuth login screen's two-column layout. */
+static int draw_left_wrapped(int x, int y, uint32_t color, const char *text,
+			     int maxw, int line_h)
+{
+	struct wrap_style s = { color, x, 0 };
+	return wrap_lines(y, text, maxw, line_h, wrap_emit, &s);
 }
 
 /* startup loading screen: the Immich logo spinning, with text below it */

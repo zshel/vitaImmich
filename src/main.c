@@ -54,6 +54,8 @@
 #define JSMN_PARENT_LINKS
 #include "jsmn.h"
 
+#include "qrcodegen.h"
+
 #define SCREEN_W 960
 #define SCREEN_H 544
 
@@ -156,6 +158,7 @@ static char (*g_tex_err)[160];
 /* was one main.c. Only this file is compiled (see CMakeLists.txt).    */
 /* ------------------------------------------------------------------ */
 
+#include "qrcodegen.c" /* vendored QR Code generator (Project Nayuki)    */
 #include "state.c"     /* local media + sync state, array-grow helpers   */
 #include "draw.c"      /* text/logo/error drawing helpers                */
 #include "config.c"    /* config.txt load/save                          */
